@@ -1,0 +1,51 @@
+[project]
+name = "kasa-lights-sync"
+version = "0.1.0"
+description = "Music Assistant plugin that syncs TP-Link Kasa smart lights to music in real time."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "Zach Feldman" }]
+keywords = ["music-assistant", "kasa", "tplink", "lighting", "home-assistant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+]
+dependencies = [
+    "python-kasa>=0.10.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/zachfeldman/kasa-lights-sync"
+Issues = "https://github.com/zachfeldman/kasa-lights-sync/issues"
+
+# Registers this package so music-assistant-plugin-manager's import-hook/manifest
+# patch (https://github.com/TigreGotico/music-assistant-plugin-manager) can find
+# it at startup without any change to Music Assistant's own source tree. See
+# README.md for why this project is standalone rather than a fork of
+# music-assistant/server.
+[project.entry-points."music_assistant.provider"]
+kasa_lights_sync = "kasa_lights_sync"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kasa_lights_sync = ["manifest.json", "*.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
