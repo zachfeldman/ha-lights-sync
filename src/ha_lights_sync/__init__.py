@@ -1,10 +1,11 @@
 """
-Kasa Lights Sync - Music Assistant plugin.
+HA Lights Sync - Music Assistant plugin.
 
-Syncs TP-Link Kasa smart lights/light strips to music in real time, reusing
-the same Sendspin visualizer pipeline (live spectrum + beat schedule) that
-Music Assistant's built-in Hue Lights Sync plugin uses - see README.md for
-the full architecture writeup and why this exists as its own package rather
+Syncs any Home Assistant light to music in real time, reusing the same
+Sendspin visualizer pipeline (live spectrum + beat schedule) that Music
+Assistant's built-in Hue Lights Sync plugin uses, and Home Assistant's own
+light.turn_on service to actually drive the light - see README.md for the
+full architecture writeup and why this exists as its own package rather
 than a fork of music-assistant/server.
 """
 
@@ -29,9 +30,9 @@ async def setup(
     config: ProviderConfig,
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
-    from .provider import KasaLightsSyncProvider
+    from .provider import HALightsSyncProvider
 
     return cast(
         "ProviderInstanceType",
-        KasaLightsSyncProvider(mass, manifest, config, SUPPORTED_FEATURES),
+        HALightsSyncProvider(mass, manifest, config, SUPPORTED_FEATURES),
     )

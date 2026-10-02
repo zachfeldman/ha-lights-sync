@@ -1,28 +1,33 @@
 """
-Kasa bridge — in-process Sendspin visualizer client.
+HA Lights bridge — in-process Sendspin visualizer client.
 
-Registers one virtual Sendspin player of type LIGHT per configured device
+Registers one virtual Sendspin player of type LIGHT per configured light
 group (see provider.py). The user groups that virtual player with whatever
 real Music Assistant player is playing to the room - same workflow as the
 built-in Hue Lights Sync plugin ("join a Hue light player to any active
 Sendspin player").
 
-This file is the Kasa-specific half of the split described in
+This file is the transport-specific half of the split described in
 music_assistant/providers/hue_entertainment/bridge.py's own docstring: the
 Sendspin registration, callback wiring and render-loop scheduling are the
 same shape as the Hue plugin uses (deliberately - this is the pattern
 Music Assistant expects a lighting bridge to follow). What's different:
 
-- No DTLS session: a KasaCommand is sent as a plain local-network
-  set_hsv()/set_brightness() call via python-kasa.
+- No DTLS session, no device-specific protocol client at all: a LightCommand
+  is sent as a plain `light.turn_on` service call through Music Assistant's
+  own "Home Assistant" plugin (`mass.get_provider("hass").hass`, a
+  `hass_client.HomeAssistantClient` - already connected/authenticated by that
+  plugin, no separate config needed here). This is what makes the plugin
+  work with *any* light Home Assistant controls - Kasa, Hue, LIFX, Zigbee,
+  whatever - rather than needing its own device-specific transport per brand.
 - The render loop runs at RENDER_RATE_HZ (const.py), much lower than Hue's
-  30Hz, because Kasa's protocol is one request/response round trip per
-  command rather than a continuous stream - see const.py's
-  DEFAULT_KASA_LATENCY_MS comment for the reasoning. Each command carries a
-  `transition_ms` spanning the render period so the strip eases between
-  points instead of visibly stepping.
+  30Hz, because a service call is one request/response round trip (through
+  HA's websocket API, then whatever HA does internally) rather than a
+  continuous stream - see const.py's DEFAULT_HA_LATENCY_MS comment. Each
+  command carries a `transition` spanning the render period so the light
+  eases between points instead of visibly stepping.
 - Sends are fire-and-forget tasks, skipped (not queued) if the previous one
-  for the same device hasn't finished - a slow/unreachable strip must never
+  for the same entity hasn't finished - a slow/unavailable light must never
   back up the render loop or send commands out of order.
 """
 
@@ -39,12 +44,11 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSpectrum,
     ClientHelloVisualizerSupport,
 )
-from kasa import Device, Discover, Module
 from music_assistant_models.enums import PlayerType
 
 from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROLE_ID, BridgeVisualizerRole
 
-from .analyzer import KasaAudioAnalyzer
+from .analyzer import HALightsAudioAnalyzer
 from .const import (
     RENDER_PERIOD_S,
     SPECTRUM_BINS,
@@ -58,37 +62,39 @@ if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
     from aiosendspin.server.roles.visualizer.features import ExtractedFrame
     from aiosendspin.models.visualizer import BeatTiming
+    from hass_client import HomeAssistantClient
 
     from music_assistant.providers.sendspin.provider import SendspinProvider
 
-    from .provider import KasaLightsSyncProvider
+    from .analyzer import LightCommand
+    from .provider import HALightsSyncProvider
 
 LOGGER = logging.getLogger(__name__)
 
 # Debounce before actually tearing a stream down, so a track transition's
-# brief gap doesn't drop and reopen device connections every song.
+# brief gap doesn't flap the Sendspin client every song.
 _STOP_DEBOUNCE_S = 2.0
 
 
-class KasaLightGroupBridge:
-    """Manages one configured group of Kasa lights as a Sendspin visualizer client."""
+class HALightGroupBridge:
+    """Manages one configured group of Home Assistant lights as a Sendspin visualizer client."""
 
     def __init__(
         self,
-        provider: KasaLightsSyncProvider,
+        provider: HALightsSyncProvider,
         group_name: str,
-        device_hosts: list[str],
+        entity_ids: list[str],
         sendspin_server: SendspinServer,
     ) -> None:
         self.provider = provider
         self.mass = provider.mass
         self.group_name = group_name
-        self.device_hosts = device_hosts
+        self.entity_ids = entity_ids
         self.sendspin_server = sendspin_server
         self.logger = LOGGER.getChild(f"bridge.{group_name}")
 
-        self._analyzer: KasaAudioAnalyzer | None = None
-        self._devices: dict[str, Device] = {}
+        self._analyzer: HALightsAudioAnalyzer | None = None
+        self._hass: HomeAssistantClient | None = None
         self._pending_send: dict[str, asyncio.Task[None]] = {}
         self._sendspin_client: SendspinClient | None = None
         self._is_streaming = False
@@ -96,24 +102,21 @@ class KasaLightGroupBridge:
         self._render_handle: asyncio.TimerHandle | None = None
 
     async def start(self) -> None:
-        """Connect to the configured Kasa devices and register as a Sendspin visualizer client."""
-        for host in self.device_hosts:
-            try:
-                device = await Discover.discover_single(host)
-                await device.update()
-                if Module.Light not in device.modules:
-                    self.logger.warning("%s does not expose a Light module, skipping", host)
-                    continue
-                self._devices[host] = device
-            except Exception:
-                self.logger.exception("Could not connect to Kasa device at %s", host)
+        """Grab the Home Assistant connection and register as a Sendspin visualizer client."""
+        hass_provider = self.mass.get_provider("hass")
+        if hass_provider is None or not getattr(hass_provider, "hass", None):
+            raise RuntimeError(
+                "The 'Home Assistant' plugin provider must be loaded and connected first "
+                "(Settings -> Add Provider -> Home Assistant)"
+            )
+        self._hass = hass_provider.hass
 
-        self._analyzer = KasaAudioAnalyzer(
+        self._analyzer = HALightsAudioAnalyzer(
             color_mode=self.provider.get_color_mode(),
             brightness=self.provider.get_brightness(),
         )
 
-        client_id = f"kasa-{self.group_name.lower().replace(' ', '-')[:24]}"
+        client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
 
         sendspin_prov: SendspinProvider | None = self.mass.get_provider("sendspin")  # type: ignore[assignment]
         if sendspin_prov:
@@ -132,10 +135,10 @@ class KasaLightGroupBridge:
         )
         hello = ClientHelloPayload(
             client_id=client_id,
-            name=f"Kasa: {self.group_name}",
+            name=f"HA Lights: {self.group_name}",
             version=1,
             supported_roles=[VISUALIZER_BRIDGE_ROLE_ID],
-            device_info=SendspinDeviceInfo(manufacturer="TP-Link", product_name="Kasa Light Strip"),
+            device_info=SendspinDeviceInfo(manufacturer="Home Assistant", product_name="Light Group"),
             visualizer_support=support,
         )
         self._sendspin_client = self.sendspin_server.register_external_player(
@@ -156,14 +159,14 @@ class KasaLightGroupBridge:
         self._sendspin_client.attach_preinitialized_roles()
 
         self.logger.info(
-            "Kasa bridge started for '%s' (%d device(s) connected of %d configured)",
+            "HA Lights bridge started for '%s' (%d entit%s configured)",
             self.group_name,
-            len(self._devices),
-            len(self.device_hosts),
+            len(self.entity_ids),
+            "y" if len(self.entity_ids) == 1 else "ies",
         )
 
     async def stop(self) -> None:
-        """Stop the bridge and release device connections."""
+        """Stop the bridge."""
         self._cancel_render_loop()
         if self._stop_debounce_task and not self._stop_debounce_task.done():
             self._stop_debounce_task.cancel()
@@ -179,12 +182,9 @@ class KasaLightGroupBridge:
             task.cancel()
         self._pending_send.clear()
 
-        for device in self._devices.values():
-            with suppress(Exception):
-                await device.disconnect()
-        self._devices.clear()
+        self._hass = None
         self._is_streaming = False
-        self.logger.debug("Kasa bridge stopped for '%s'", self.group_name)
+        self.logger.debug("HA Lights bridge stopped for '%s'", self.group_name)
 
     def update_settings(self, color_mode: str | None = None, brightness: int | None = None) -> None:
         """Update analyzer settings without restarting the bridge."""
@@ -256,32 +256,42 @@ class KasaLightGroupBridge:
             if self._analyzer is not None:
                 now_s = self.sendspin_server.clock.now_us() / 1_000_000
                 command = self._analyzer.render(now_s)
-                for host in self._devices:
-                    self._dispatch_send(host, command)
+                for entity_id in self.entity_ids:
+                    self._dispatch_send(entity_id, command)
         except Exception:
-            self.logger.exception("Kasa render tick failed for '%s'", self.group_name)
+            self.logger.exception("Render tick failed for '%s'", self.group_name)
         finally:
             if self._is_streaming:
                 self._render_handle = self.mass.loop.call_later(RENDER_PERIOD_S, self._render_tick)
 
-    def _dispatch_send(self, host: str, command) -> None:  # noqa: ANN001 - KasaCommand, see analyzer.py
-        """Fire the device command as a task, skipping if the previous send is still in flight."""
-        pending = self._pending_send.get(host)
+    def _dispatch_send(self, entity_id: str, command: LightCommand) -> None:
+        """Fire the service call as a task, skipping if the previous send is still in flight."""
+        pending = self._pending_send.get(entity_id)
         if pending is not None and not pending.done():
             return
-        self._pending_send[host] = self.mass.create_task(self._send_command(host, command))
+        self._pending_send[entity_id] = self.mass.create_task(
+            self._send_command(entity_id, command)
+        )
 
-    async def _send_command(self, host: str, command) -> None:  # noqa: ANN001
-        device = self._devices.get(host)
-        if device is None:
+    async def _send_command(self, entity_id: str, command: LightCommand) -> None:
+        if self._hass is None:
             return
         try:
-            light = device.modules[Module.Light]
-            await light.set_hsv(
-                command.hue,
-                command.saturation,
-                command.brightness,
-                transition=command.transition_ms,
+            await self._hass.call_service(
+                "light",
+                "turn_on",
+                service_data={
+                    "hs_color": [command.hue, command.saturation],
+                    "brightness_pct": command.brightness,
+                    # light.turn_on's transition is in seconds, unlike the
+                    # millisecond unit used everywhere else in this plugin
+                    # (matching python-kasa's/Hue's convention) - convert here,
+                    # at the one spot that actually calls the HA service.
+                    "transition": command.transition_ms / 1000.0,
+                },
+                target={"entity_id": entity_id},
             )
         except Exception:
-            self.logger.debug("Kasa command to %s failed (will retry next tick)", host, exc_info=True)
+            self.logger.debug(
+                "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True
+            )

@@ -1,0 +1,14 @@
+{
+  "type": "plugin",
+  "stage": "experimental",
+  "domain": "ha_lights_sync",
+  "name": "HA Lights Sync",
+  "description": "Sync any Home Assistant light to music in real time, using Music Assistant's visualizer pipeline (the same beat/spectrum feed the built-in Hue Lights Sync plugin uses) and Home Assistant's own light.turn_on service - works with any light HA already controls (Kasa, Hue, LIFX, Zigbee, whatever), with zero extra setup beyond picking the entities.",
+  "codeowners": ["@zachfeldman"],
+  "depends_on": "sendspin",
+  "requirements": [],
+  "documentation": "https://github.com/zachfeldman/ha-lights-sync",
+  "multi_instance": true,
+  "builtin": false,
+  "icon": "led-strip-variant"
+}

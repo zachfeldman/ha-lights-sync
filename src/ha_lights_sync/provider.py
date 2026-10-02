@@ -1,10 +1,17 @@
 """
-Kasa Lights Sync provider for Music Assistant.
+HA Lights Sync provider for Music Assistant.
 
-Each configured provider instance drives one group of Kasa lights (e.g. "all
-the garage strips") as a single virtual Sendspin player - group it with a
-real player in the Music Assistant UI the same way you'd group a Hue Lights
-Sync player, and the configured lights react to whatever that player plays.
+Each configured provider instance drives one group of Home Assistant lights
+(e.g. "all the garage strips") as a single virtual Sendspin player - group it
+with a real player in the Music Assistant UI the same way you'd group a Hue
+Lights Sync player, and the configured lights react to whatever that player
+plays.
+
+The light picker below is populated live from Home Assistant's own entity
+states via `mass.get_provider("hass")` - the same connection Music
+Assistant's built-in "Home Assistant" plugin already maintains. There is
+nothing else to set up: no device IPs, no separate pairing. If a light is
+already in Home Assistant, it shows up here.
 
 Add the provider again (manifest declares multi_instance: true) for a second
 independently-configured room/group.
@@ -20,11 +27,11 @@ from music_assistant_models.enums import ConfigEntryType
 
 from music_assistant.models.plugin import PluginProvider
 
-from .bridge import KasaLightGroupBridge
+from .bridge import HALightGroupBridge
 from .const import (
     CONF_BRIGHTNESS,
     CONF_COLOR_MODE,
-    CONF_DEVICE_HOSTS,
+    CONF_LIGHT_ENTITIES,
     COLOR_MODES,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
@@ -40,8 +47,8 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 
-class KasaLightsSyncProvider(PluginProvider):
-    """Provider that syncs a group of Kasa lights to music via Sendspin."""
+class HALightsSyncProvider(PluginProvider):
+    """Provider that syncs a group of Home Assistant lights to music via Sendspin."""
 
     def __init__(
         self,
@@ -51,22 +58,23 @@ class KasaLightsSyncProvider(PluginProvider):
         supported_features: set[ProviderFeature],
     ) -> None:
         super().__init__(mass, manifest, config, supported_features)
-        self._bridge: KasaLightGroupBridge | None = None
+        self._bridge: HALightGroupBridge | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return the (options) config entries for this provider instance."""
         return (
             ConfigEntry(
-                key=CONF_DEVICE_HOSTS,
+                key=CONF_LIGHT_ENTITIES,
                 type=ConfigEntryType.STRING,
-                label="Kasa device IP address(es)",
+                label="Light(s)",
                 description=(
-                    "Comma-separated local IPs of the Kasa light strips/bulbs this "
-                    "group should drive, e.g. 192.168.1.40,192.168.1.41. Use a DHCP "
-                    "reservation on each device - python-kasa connects by IP, not by "
-                    "the Kasa app's device name."
+                    "The Home Assistant light entities this group should drive. Pulled "
+                    "live from Home Assistant - if a light is already set up there "
+                    "(any brand/integration), it's selectable here, no extra setup needed."
                 ),
                 required=True,
+                multi_value=True,
+                options=await self._light_entity_options(),
                 category="settings",
             ),
             ConfigEntry(
@@ -85,6 +93,38 @@ class KasaLightsSyncProvider(PluginProvider):
             ),
         )
 
+    async def _light_entity_options(self) -> list[ConfigValueOption]:
+        """
+        Return every light.* entity Home Assistant currently knows about.
+
+        Empty (rather than raising) when the Home Assistant plugin isn't
+        loaded/connected yet, so the config screen still renders - with a
+        clear "nothing to pick" state - instead of failing to open at all.
+        """
+        hass_provider = self.mass.get_provider("hass")
+        hass = getattr(hass_provider, "hass", None) if hass_provider else None
+        if hass is None:
+            self.logger.warning(
+                "Home Assistant plugin not loaded/connected - add and configure it first "
+                "(Settings -> Add Provider -> Home Assistant) to pick lights here"
+            )
+            return []
+        try:
+            states = await hass.get_states()
+        except Exception:
+            self.logger.exception("Could not fetch light entities from Home Assistant")
+            return []
+        options = [
+            ConfigValueOption(
+                state["entity_id"],
+                title=state["attributes"].get("friendly_name", state["entity_id"]),
+            )
+            for state in states
+            if state["entity_id"].startswith("light.")
+        ]
+        options.sort(key=lambda opt: opt.title.casefold())
+        return options
+
     def get_color_mode(self) -> str:
         value = self.config.get_value(CONF_COLOR_MODE)
         return str(value) if value in COLOR_MODES else DEFAULT_COLOR_MODE
@@ -96,15 +136,17 @@ class KasaLightsSyncProvider(PluginProvider):
         except (TypeError, ValueError):
             return DEFAULT_BRIGHTNESS
 
-    def get_device_hosts(self) -> list[str]:
-        raw = str(self.config.get_value(CONF_DEVICE_HOSTS) or "")
-        return [host.strip() for host in raw.split(",") if host.strip()]
+    def get_light_entity_ids(self) -> list[str]:
+        value = self.config.get_value(CONF_LIGHT_ENTITIES)
+        if isinstance(value, list):
+            return [str(v) for v in value if v]
+        return [str(value)] if value else []
 
     async def loaded_in_mass(self) -> None:
-        """Connect to the configured Kasa devices and start the Sendspin bridge."""
-        hosts = self.get_device_hosts()
-        if not hosts:
-            self.logger.warning("No Kasa device IPs configured, provider inactive")
+        """Start the Sendspin bridge for the configured light entities."""
+        entity_ids = self.get_light_entity_ids()
+        if not entity_ids:
+            self.logger.warning("No light entities configured, provider inactive")
             self.available = False
             return
 
@@ -114,14 +156,14 @@ class KasaLightsSyncProvider(PluginProvider):
             self.available = False
             return
 
-        self._bridge = KasaLightGroupBridge(
-            self, self.name or self.instance_id, hosts, sendspin_server
+        self._bridge = HALightGroupBridge(
+            self, self.name or self.instance_id, entity_ids, sendspin_server
         )
         try:
             await self._bridge.start()
             self.available = True
         except Exception:
-            self.logger.exception("Failed to start Kasa bridge")
+            self.logger.exception("Failed to start HA Lights bridge")
             self.available = False
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -135,7 +177,7 @@ class KasaLightsSyncProvider(PluginProvider):
         Handle config changes.
 
         brightness/color_mode can be applied to the running bridge in place;
-        anything else (notably device_hosts) falls through to the base
+        anything else (notably light_entities) falls through to the base
         implementation, which reloads the provider - matches
         HueEntertainmentProvider.update_config's split, see
         music_assistant/providers/hue_entertainment/provider.py.

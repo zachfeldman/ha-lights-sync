@@ -1,25 +1,27 @@
 [project]
-name = "kasa-lights-sync"
+name = "ha-lights-sync"
 version = "0.1.0"
-description = "Music Assistant plugin that syncs TP-Link Kasa smart lights to music in real time."
+description = "Music Assistant plugin that syncs any Home Assistant light to music in real time."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 authors = [{ name = "Zach Feldman" }]
-keywords = ["music-assistant", "kasa", "tplink", "lighting", "home-assistant"]
+keywords = ["music-assistant", "home-assistant", "lighting", "sync"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: End Users/Desktop",
     "Programming Language :: Python :: 3.12",
     "Topic :: Home Automation",
 ]
-dependencies = [
-    "python-kasa>=0.10.2",
-]
+# No runtime dependencies of its own: lights are driven through Music
+# Assistant's own "Home Assistant" plugin (hass_client), which is already a
+# dependency of that plugin, not of this one. See README's architecture
+# section.
+dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/zachfeldman/kasa-lights-sync"
-Issues = "https://github.com/zachfeldman/kasa-lights-sync/issues"
+Homepage = "https://github.com/zachfeldman/ha-lights-sync"
+Issues = "https://github.com/zachfeldman/ha-lights-sync/issues"
 
 # Registers this package so music-assistant-plugin-manager's import-hook/manifest
 # patch (https://github.com/TigreGotico/music-assistant-plugin-manager) can find
@@ -27,7 +29,7 @@ Issues = "https://github.com/zachfeldman/kasa-lights-sync/issues"
 # README.md for why this project is standalone rather than a fork of
 # music-assistant/server.
 [project.entry-points."music_assistant.provider"]
-kasa_lights_sync = "kasa_lights_sync"
+ha_lights_sync = "ha_lights_sync"
 
 [project.optional-dependencies]
 dev = [
@@ -43,7 +45,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-kasa_lights_sync = ["manifest.json", "*.json"]
+ha_lights_sync = ["manifest.json", "*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

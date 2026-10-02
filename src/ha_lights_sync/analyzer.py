@@ -1,5 +1,5 @@
 """
-Turns Sendspin visualizer features into Kasa light targets.
+Turns Sendspin visualizer features into light targets.
 
 Mirrors the shape of Music Assistant's built-in HueAudioAnalyzer
 (music_assistant/providers/hue_entertainment/analyzer.py): accumulate the
@@ -9,19 +9,18 @@ current state into a light command.
 
 The two real differences from the Hue version:
 
-1. Output is a single flat KasaCommand (hue/saturation/brightness/transition_ms)
-   rather than a per-channel list - these strips are one color zone each, not
-   a multi-point Entertainment Area.
+1. Output is a single flat LightCommand (hue/saturation/brightness/transition_ms)
+   rather than a per-channel list - a Home Assistant light group is one or two
+   color zones, not a multi-point Entertainment Area.
 2. render() is called at RENDER_RATE_HZ (see const.py), not Hue's 30Hz, and
-   leans on the strip's own `transition` parameter to interpolate rather than
-   repainting every frame - see bridge.py for why.
+   leans on light.turn_on's own `transition` parameter to interpolate rather
+   than repainting every frame - see bridge.py for why.
 """
 
 from __future__ import annotations
 
-import colorsys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .const import COLOR_MODES, DEFAULT_BRIGHTNESS, DEFAULT_COLOR_MODE, RENDER_PERIOD_S
 
@@ -35,8 +34,8 @@ _BEAT_STALE_S = 1.5
 
 
 @dataclass(frozen=True)
-class KasaCommand:
-    """One target state for a Kasa light, handed to the bridge to send."""
+class LightCommand:
+    """One target state for a light, handed to the bridge to send via light.turn_on."""
 
     hue: int  # degrees, 0-360
     saturation: int  # percent, 0-100
@@ -100,9 +99,9 @@ class _ScheduledBeat:
     is_downbeat: bool
 
 
-class KasaAudioAnalyzer:
+class HALightsAudioAnalyzer:
     """
-    Accumulates visualizer features for one Sendspin client and renders Kasa targets.
+    Accumulates visualizer features for one Sendspin client and renders light targets.
 
     One instance per configured light group (see provider.py) - matches a
     HueAudioAnalyzer per Entertainment Area in the upstream plugin.
@@ -114,7 +113,6 @@ class KasaAudioAnalyzer:
         self._bass = _ExpFilter(alpha_rise=0.6, alpha_decay=0.08, initial=0.0)
         self._treble = _ExpFilter(alpha_rise=0.5, alpha_decay=0.1, initial=0.0)
         self._beats: list[_ScheduledBeat] = []
-        self._last_fired_beat_s: float = 0.0
         self._last_beat_flash_s: float = -10.0
         self._hue_base: float = 0.0
         self._last_render_s: float = time.monotonic()
@@ -153,7 +151,7 @@ class KasaAudioAnalyzer:
     def clear_beats(self) -> None:
         self._beats.clear()
 
-    def render(self, now_s: float) -> KasaCommand:
+    def render(self, now_s: float) -> LightCommand:
         """Compute the light command for this instant; called at RENDER_RATE_HZ."""
         preset = _PRESETS[self.color_mode]
         dt = max(0.0, now_s - self._last_render_s)
@@ -179,7 +177,7 @@ class KasaAudioAnalyzer:
         hue_shift = self._treble.value * 20.0  # treble brightens/cools the hue slightly
         hue = round((self._hue_base + hue_shift) % 360)
 
-        return KasaCommand(
+        return LightCommand(
             hue=hue,
             saturation=saturation,
             brightness=brightness_pct,
@@ -201,12 +199,3 @@ class KasaAudioAnalyzer:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
-
-
-def hsv_to_kasa(hue: int, saturation: int, brightness: int) -> tuple[int, int, int]:
-    """
-    Pass-through today - python-kasa's set_hsv already takes hue/saturation/value in
-    the same ranges this module computes in. Kept as a seam in case a future device
-    needs RGB instead (e.g. via colorsys.hsv_to_rgb) without touching the analyzer.
-    """
-    return hue, saturation, brightness
