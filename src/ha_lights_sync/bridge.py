@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 
@@ -268,6 +269,10 @@ class HALightGroupBridge:
         """Fire the service call as a task, skipping if the previous send is still in flight."""
         pending = self._pending_send.get(entity_id)
         if pending is not None and not pending.done():
+            # TEMPORARY diagnostic (see _send_command) - tells us whether the
+            # render rate is actually being throttled by real round-trip time,
+            # which would explain fast songs feeling slower than they should.
+            self.logger.info("Skipped render for %s - previous send still in flight", entity_id)
             return
         self._pending_send[entity_id] = self.mass.create_task(
             self._send_command(entity_id, command)
@@ -276,6 +281,13 @@ class HALightGroupBridge:
     async def _send_command(self, entity_id: str, command: LightCommand) -> None:
         if self._hass is None:
             return
+        # TEMPORARY diagnostic: log the actual light.turn_on round-trip time.
+        # If this regularly exceeds RENDER_PERIOD_S (250ms at the current
+        # RENDER_RATE_HZ=4), _dispatch_send's skip-if-pending guard would be
+        # silently dropping renders - which would look exactly like "the
+        # lights can't keep up with a fast song" even though the beat
+        # schedule itself is tempo-correct. Remove once we have real numbers.
+        start = time.monotonic()
         try:
             await self._hass.call_service(
                 "light",
@@ -291,6 +303,8 @@ class HALightGroupBridge:
                 },
                 target={"entity_id": entity_id},
             )
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+            self.logger.info("light.turn_on for %s took %dms", entity_id, elapsed_ms)
         except Exception:
             self.logger.debug(
                 "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True
