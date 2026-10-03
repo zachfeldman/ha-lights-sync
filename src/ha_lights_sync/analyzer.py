@@ -28,7 +28,9 @@ from .const import (
     DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
+    DEFAULT_TRANSITION_STYLE,
     RENDER_PERIOD_S,
+    TRANSITION_STYLES,
 )
 
 # Beat flashes normally decay over this long. Tightened automatically for
@@ -133,10 +135,14 @@ class HALightsAudioAnalyzer:
         color_mode: str = DEFAULT_COLOR_MODE,
         brightness: int = DEFAULT_BRIGHTNESS,
         beat_multiplier: int = DEFAULT_BEAT_MULTIPLIER,
+        transition_style: str = DEFAULT_TRANSITION_STYLE,
     ) -> None:
         self.color_mode = color_mode if color_mode in COLOR_MODES else DEFAULT_COLOR_MODE
         self.brightness_ceiling = brightness
         self.beat_multiplier = beat_multiplier if beat_multiplier in BEAT_MULTIPLIERS else DEFAULT_BEAT_MULTIPLIER
+        self.transition_style = (
+            transition_style if transition_style in TRANSITION_STYLES else DEFAULT_TRANSITION_STYLE
+        )
         self._bass = _ExpFilter(alpha_rise=0.6, alpha_decay=0.08, initial=0.0)
         self._treble = _ExpFilter(alpha_rise=0.5, alpha_decay=0.1, initial=0.0)
         self._beats: list[_ScheduledBeat] = []
@@ -151,6 +157,7 @@ class HALightsAudioAnalyzer:
         color_mode: str | None = None,
         brightness: int | None = None,
         beat_multiplier: int | None = None,
+        transition_style: str | None = None,
     ) -> None:
         if color_mode is not None and color_mode in COLOR_MODES:
             self.color_mode = color_mode
@@ -158,6 +165,8 @@ class HALightsAudioAnalyzer:
             self.brightness_ceiling = brightness
         if beat_multiplier is not None and beat_multiplier in BEAT_MULTIPLIERS:
             self.beat_multiplier = beat_multiplier
+        if transition_style is not None and transition_style in TRANSITION_STYLES:
+            self.transition_style = transition_style
 
     def apply_spectrum(self, bins: list[float]) -> None:
         """
@@ -252,11 +261,16 @@ class HALightsAudioAnalyzer:
         hue_shift = self._treble.value * 20.0  # treble brightens/cools the hue slightly
         hue = round((self._hue_base + hue_shift) % 360)
 
+        # "instant" sends transition=0 (a hard, un-eased cut on every render -
+        # a punchier "solid change" on the beat); "fade" spans the render
+        # period so continuous drift still looks smooth. See const.py.
+        transition_ms = 0 if self.transition_style == "instant" else round(RENDER_PERIOD_S * 1000)
+
         return LightCommand(
             hue=hue,
             saturation=saturation,
             brightness=brightness_pct,
-            transition_ms=round(RENDER_PERIOD_S * 1000),
+            transition_ms=transition_ms,
         )
 
     def _consume_due_beat(self, now_s: float) -> _ScheduledBeat | None:

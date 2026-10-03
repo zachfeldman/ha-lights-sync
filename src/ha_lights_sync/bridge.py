@@ -121,6 +121,7 @@ class HALightGroupBridge:
             color_mode=self.provider.get_color_mode(),
             brightness=self.provider.get_brightness(),
             beat_multiplier=self.provider.get_beat_multiplier(),
+            transition_style=self.provider.get_transition_style(),
         )
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
@@ -198,11 +199,15 @@ class HALightGroupBridge:
         color_mode: str | None = None,
         brightness: int | None = None,
         beat_multiplier: int | None = None,
+        transition_style: str | None = None,
     ) -> None:
         """Update analyzer settings without restarting the bridge."""
         if self._analyzer:
             self._analyzer.update_settings(
-                color_mode=color_mode, brightness=brightness, beat_multiplier=beat_multiplier
+                color_mode=color_mode,
+                brightness=brightness,
+                beat_multiplier=beat_multiplier,
+                transition_style=transition_style,
             )
 
     # -- Sendspin callbacks --

@@ -36,10 +36,13 @@ from .const import (
     CONF_BRIGHTNESS,
     CONF_COLOR_MODE,
     CONF_LIGHT_ENTITIES,
+    CONF_TRANSITION_STYLE,
     COLOR_MODES,
     DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
+    DEFAULT_TRANSITION_STYLE,
+    TRANSITION_STYLES,
 )
 
 if TYPE_CHECKING:
@@ -104,6 +107,23 @@ class HALightsSyncProvider(PluginProvider):
                 options=[ConfigValueOption(n, title=f"{n}x") for n in BEAT_MULTIPLIERS],
                 category="settings",
             ),
+            ConfigEntry(
+                key=CONF_TRANSITION_STYLE,
+                type=ConfigEntryType.STRING,
+                label="Transition style",
+                description=(
+                    "'Fade' eases between colors/brightness smoothly. 'Instant' snaps "
+                    "to a hard, un-eased change on every update instead - a punchier, "
+                    "more percussive feel, at the cost of visible stepping during the "
+                    "non-beat color drift most modes also do."
+                ),
+                default_value=DEFAULT_TRANSITION_STYLE,
+                options=[
+                    ConfigValueOption("fade", title="Fade"),
+                    ConfigValueOption("instant", title="Instant"),
+                ],
+                category="settings",
+            ),
         )
 
     def get_color_mode(self) -> str:
@@ -124,6 +144,10 @@ class HALightsSyncProvider(PluginProvider):
         except (TypeError, ValueError):
             return DEFAULT_BEAT_MULTIPLIER
         return value if value in BEAT_MULTIPLIERS else DEFAULT_BEAT_MULTIPLIER
+
+    def get_transition_style(self) -> str:
+        value = self.config.get_value(CONF_TRANSITION_STYLE)
+        return str(value) if value in TRANSITION_STYLES else DEFAULT_TRANSITION_STYLE
 
     def get_light_entity_ids(self) -> list[str]:
         """
@@ -177,20 +201,28 @@ class HALightsSyncProvider(PluginProvider):
         """
         Handle config changes.
 
-        brightness/color_mode/beat_multiplier can be applied to the running
-        bridge in place; anything else (notably light_entities) falls
-        through to the base implementation, which reloads the provider -
-        matches HueEntertainmentProvider.update_config's split, see
+        brightness/color_mode/beat_multiplier/transition_style can be applied
+        to the running bridge in place; anything else (notably
+        light_entities) falls through to the base implementation, which
+        reloads the provider - matches HueEntertainmentProvider.
+        update_config's split, see
         music_assistant/providers/hue_entertainment/provider.py.
         """
         settings_keys = {
-            f"values/{key}" for key in (CONF_BRIGHTNESS, CONF_COLOR_MODE, CONF_BEAT_MULTIPLIER)
+            f"values/{key}"
+            for key in (
+                CONF_BRIGHTNESS,
+                CONF_COLOR_MODE,
+                CONF_BEAT_MULTIPLIER,
+                CONF_TRANSITION_STYLE,
+            )
         }
         if changed_keys and changed_keys <= settings_keys and self._bridge:
             self._bridge.update_settings(
                 color_mode=self.get_color_mode(),
                 brightness=self.get_brightness(),
                 beat_multiplier=self.get_beat_multiplier(),
+                transition_style=self.get_transition_style(),
             )
             self.config = config
             return

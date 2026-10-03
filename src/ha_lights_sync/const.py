@@ -10,6 +10,7 @@ CONF_LIGHT_ENTITIES: Final[str] = "light_entities"
 CONF_COLOR_MODE: Final[str] = "color_mode"
 CONF_BRIGHTNESS: Final[str] = "brightness"
 CONF_BEAT_MULTIPLIER: Final[str] = "beat_multiplier"
+CONF_TRANSITION_STYLE: Final[str] = "transition_style"
 CONF_HA_LATENCY_MS: Final[str] = "ha_latency_ms"
 
 # -- Visualization styles --
@@ -33,6 +34,18 @@ DEFAULT_BRIGHTNESS: Final[int] = 100
 # can reliably keep up with; see README's Speed section.
 BEAT_MULTIPLIERS: Final[tuple[int, ...]] = (1, 2, 4)
 DEFAULT_BEAT_MULTIPLIER: Final[int] = BEAT_MULTIPLIERS[0]
+
+# -- Transition style --
+#
+# "fade" (default) sends a transition spanning the render period, so the
+# light eases between points - necessary at RENDER_RATE_HZ's modest update
+# rate to avoid visible stepping on continuous brightness/hue drift.
+# "instant" sends transition=0 instead: every render ties to a hard, un-eased
+# cut, which can read as a punchier/more percussive "solid change" on the
+# beat rather than a morph - at the cost of that same stepping becoming
+# visible during non-beat drift (hue_drift_deg_s, bass-driven brightness).
+TRANSITION_STYLES: Final[tuple[str, ...]] = ("fade", "instant")
+DEFAULT_TRANSITION_STYLE: Final[str] = TRANSITION_STYLES[0]
 
 # How far ahead of "now" a render target is scheduled, to absorb command
 # round-trip time through Home Assistant's light.turn_on service (our own

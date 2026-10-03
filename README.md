@@ -248,8 +248,9 @@ to you:
 | `color_mode` | `smooth` (gentle, beat-tinted color drift), `ambient` (slower, bass-reactive saturation), `flashing` (strong pulse every beat), `energetic` (big brightness swings, fast color rotation). |
 | `brightness` | 1–100, the ceiling this group renders up to. |
 | `beat_multiplier` ("Speed") | `1x`, `2x`, or `4x` pulses per beat (see below). |
+| `transition_style` ("Transition style") | `fade` (default, eases between colors/brightness) or `instant` (hard, un-eased cut on every update - see below). |
 
-All four settings apply to the running bridge immediately on save - no
+All five settings apply to the running bridge immediately on save - no
 restart, no re-grouping needed.
 
 ### Speed (`beat_multiplier`)
@@ -273,6 +274,27 @@ commands never arrive out of order) - logged as a `WARNING`
 of these on a very fast 4x track is normal; constant skipping means your
 light/network is the bottleneck, not a setting to tune away here - try 2x
 instead, or a less chatty light integration.
+
+### Transition style (`transition_style`)
+
+Every render sends a `transition` to `light.turn_on` alongside the target
+color/brightness. `fade` (the default) sets it to the render period
+(125ms at the default `RENDER_RATE_HZ`), so the light eases into each new
+value - necessary for the continuous parts of the effect (hue drift,
+bass-driven brightness swell) to look smooth rather than stepped, given how
+infrequently a service call can realistically be sent compared to Hue
+Entertainment's true continuous streaming.
+
+`instant` sets `transition: 0` instead: no easing at all, just a hard cut on
+every single update. The beat flash itself reads punchier and more
+percussive this way - a "solid change in tempo" rather than a fade - but the
+tradeoff is that the non-beat drift most color modes also do (hue rotation,
+bass-reactive brightness) becomes visibly stepped too, since there's no
+longer anything smoothing the gaps between renders. If that stepping bothers
+you more than the fade softened the beat hits, `flashing` mode's own design
+(floor near zero, almost no hue drift between beats) pairs especially well
+with `instant`, since there's little continuous motion for the stepping to
+show up in.
 
 ## Development
 

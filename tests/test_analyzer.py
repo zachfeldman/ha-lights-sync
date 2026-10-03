@@ -157,3 +157,39 @@ def test_every_speed_renders_without_error(multiplier: int) -> None:
     analyzer.push_beats([(0.5, True), (1.5, False)])
     command = analyzer.render(now_s=0.5)
     assert 1 <= command.brightness <= 100
+
+
+# -- Transition style --
+
+
+def test_fade_is_the_default_and_spans_the_render_period() -> None:
+    from ha_lights_sync.const import RENDER_PERIOD_S
+
+    analyzer = HALightsAudioAnalyzer()
+    assert analyzer.transition_style == "fade"
+    command = analyzer.render(now_s=0.0)
+    assert command.transition_ms == round(RENDER_PERIOD_S * 1000)
+
+
+def test_instant_style_sends_zero_transition() -> None:
+    analyzer = HALightsAudioAnalyzer(transition_style="instant")
+    command = analyzer.render(now_s=0.0)
+    assert command.transition_ms == 0
+
+
+def test_invalid_transition_style_falls_back_to_fade() -> None:
+    analyzer = HALightsAudioAnalyzer(transition_style="teleport")
+    assert analyzer.transition_style == "fade"
+
+
+def test_update_settings_changes_transition_style() -> None:
+    analyzer = HALightsAudioAnalyzer(transition_style="fade")
+    analyzer.update_settings(transition_style="instant")
+    assert analyzer.transition_style == "instant"
+    assert analyzer.render(now_s=0.0).transition_ms == 0
+
+
+def test_update_settings_ignores_invalid_transition_style() -> None:
+    analyzer = HALightsAudioAnalyzer(transition_style="instant")
+    analyzer.update_settings(transition_style="teleport")
+    assert analyzer.transition_style == "instant"
