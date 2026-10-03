@@ -98,6 +98,10 @@ class HALightGroupBridge:
         self._analyzer: HALightsAudioAnalyzer | None = None
         self._hass: HomeAssistantClient | None = None
         self._pending_send: dict[str, asyncio.Task[None]] = {}
+        # Wall-clock dispatch time per entity, independent of the task's own
+        # notion of being "done" - see _dispatch_send for why this is the
+        # thing that actually guarantees forward progress, not task.cancel().
+        self._pending_send_started_at: dict[str, float] = {}
         self._sendspin_client: SendspinClient | None = None
         self._is_streaming = False
         self._stop_debounce_task: asyncio.Task[None] | None = None
@@ -275,18 +279,46 @@ class HALightGroupBridge:
                 self._render_handle = self.mass.loop.call_later(RENDER_PERIOD_S, self._render_tick)
 
     def _dispatch_send(self, entity_id: str, command: LightCommand) -> None:
-        """Fire the service call as a task, skipping if the previous send is still in flight."""
+        """
+        Fire the service call as a task, skipping if the previous send is still in flight.
+
+        Whether a previous send counts as "still in flight" is decided by
+        wall-clock time since it was dispatched, NOT by asyncio.Task.cancel()/
+        done(). Confirmed the hard way: a call_service() that wedges deep
+        inside hass_client/aiohttp can sit "pending" indefinitely even after
+        being cancelled - cancellation only takes effect where the coroutine
+        actually yields, and a wedged one may never yield again. A timeout
+        wrapped around the await (an earlier version of this method used
+        asyncio.wait_for) inherits that same failure mode: it was observed
+        sitting stuck for 4+ minutes with zero timeout ever firing. Elapsed
+        wall-clock time can't be defeated this way, so it - not task state -
+        is what decides whether a new send goes out.
+        """
         pending = self._pending_send.get(entity_id)
+        started_at = self._pending_send_started_at.get(entity_id)
+        age_s = None if started_at is None else time.monotonic() - started_at
         if pending is not None and not pending.done():
-            # Logged at WARNING (not just debug) on purpose: a user tuning
-            # Speed up to 2x/4x needs an easy way to tell "my lights/network
-            # can't keep up with this setting" apart from "it's just not
-            # doing anything" - frequent skips here is the former, see
-            # README's Speed section.
-            self.logger.warning(
-                "Skipped render for %s - previous light.turn_on still in flight", entity_id
-            )
-            return
+            if age_s is not None and age_s > CALL_SERVICE_TIMEOUT_S:
+                self.logger.warning(
+                    "light.turn_on for %s has been stuck for over %.0fs - sending a new "
+                    "command anyway rather than waiting on it forever (the stuck call may "
+                    "still complete later; harmless if so)",
+                    entity_id,
+                    CALL_SERVICE_TIMEOUT_S,
+                )
+                pending.cancel()  # best-effort; we don't wait to see if it takes
+            else:
+                # Logged at WARNING (not just debug) on purpose: a user tuning
+                # Speed up to 2x/4x needs an easy way to tell "my lights/
+                # network can't keep up with this setting" apart from "it's
+                # just not doing anything" - frequent skips here is the
+                # former, see README's Speed section. A single stuck call
+                # (handled above) should not look identical to this.
+                self.logger.warning(
+                    "Skipped render for %s - previous light.turn_on still in flight", entity_id
+                )
+                return
+        self._pending_send_started_at[entity_id] = time.monotonic()
         self._pending_send[entity_id] = self.mass.create_task(
             self._send_command(entity_id, command)
         )
@@ -294,48 +326,35 @@ class HALightGroupBridge:
     async def _send_command(self, entity_id: str, command: LightCommand) -> None:
         if self._hass is None:
             return
-        # Round-trip time matters here, not just for curiosity: if it
-        # regularly exceeds RENDER_PERIOD_S, _dispatch_send's skip-if-pending
-        # guard above starts dropping renders - logged at DEBUG since this is
-        # the expected-success path (every render tick hits it), unlike the
-        # skip case above which is the thing worth a user's attention.
+        # Timing logged at DEBUG since this is the expected-success path
+        # (every render tick hits it); _dispatch_send's wall-clock check is
+        # what actually guards against this never returning at all.
         start = time.monotonic()
         try:
-            # wait_for matters, not just a nicety: a call_service() that never
-            # returns (seen in practice when the underlying device/integration
-            # wedges - e.g. a Cast-group protocol switch disrupting the LAN
-            # the light sits on) would otherwise leave _pending_send[entity_id]
-            # "in flight" forever, permanently skipping every future render
-            # for that one entity until the bridge restarts. A stuck call is
-            # abandoned after CALL_SERVICE_TIMEOUT_S so the next render tick
-            # gets a clean shot at it instead.
-            await asyncio.wait_for(
-                self._hass.call_service(
-                    "light",
-                    "turn_on",
-                    service_data={
-                        "hs_color": [command.hue, command.saturation],
-                        "brightness_pct": command.brightness,
-                        # light.turn_on's transition is in seconds, unlike the
-                        # millisecond unit used everywhere else in this plugin
-                        # (matching python-kasa's/Hue's convention) - convert here,
-                        # at the one spot that actually calls the HA service.
-                        "transition": command.transition_ms / 1000.0,
-                    },
-                    target={"entity_id": entity_id},
-                ),
-                timeout=CALL_SERVICE_TIMEOUT_S,
+            await self._hass.call_service(
+                "light",
+                "turn_on",
+                service_data={
+                    "hs_color": [command.hue, command.saturation],
+                    "brightness_pct": command.brightness,
+                    # light.turn_on's transition is in seconds, unlike the
+                    # millisecond unit used everywhere else in this plugin
+                    # (matching python-kasa's/Hue's convention) - convert here,
+                    # at the one spot that actually calls the HA service.
+                    "transition": command.transition_ms / 1000.0,
+                },
+                target={"entity_id": entity_id},
             )
             elapsed_ms = round((time.monotonic() - start) * 1000)
             self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
-        except TimeoutError:
-            self.logger.warning(
-                "light.turn_on for %s did not respond within %.0fs - abandoning this send "
-                "so future renders aren't permanently blocked (the light or its integration "
-                "may be stuck)",
-                entity_id,
-                CALL_SERVICE_TIMEOUT_S,
-            )
+        except asyncio.CancelledError:
+            # Raised into us by _dispatch_send's best-effort pending.cancel()
+            # above, potentially long after this coroutine actually wedged -
+            # not a real cancellation of the request in flight, just us
+            # giving up on waiting for it. Swallowed on purpose: the stuck
+            # call is already being treated as abandoned by the time this
+            # fires, so there is nothing left to report.
+            pass
         except Exception:
             self.logger.debug(
                 "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True

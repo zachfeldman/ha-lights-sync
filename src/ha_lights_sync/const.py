@@ -63,12 +63,14 @@ VISUALIZER_RATE_HZ: Final[int] = 8
 RENDER_RATE_HZ: Final[int] = 8
 RENDER_PERIOD_S: Final[float] = 1.0 / RENDER_RATE_HZ
 
-# Ceiling on one light.turn_on call. Well above the worst real round trip
-# measured during development (~220ms) - this exists purely as a backstop
-# against a call that never returns at all (seen in practice: a device/
-# integration wedging mid-call), which would otherwise jam _dispatch_send's
-# skip-if-pending guard permanently for that one entity. See bridge.py's
-# _send_command.
+# How long a light.turn_on call may sit "in flight" before _dispatch_send
+# considers it stuck and sends a new one anyway. Well above the worst real
+# round trip measured during development (~220ms) - this is purely a
+# backstop against a call that never returns at all (confirmed in practice:
+# a Cast-group protocol switch left one wedged for 4+ minutes straight).
+# This is NOT an asyncio.wait_for/cancellation timeout - see bridge.py's
+# _dispatch_send docstring for why that approach doesn't reliably work here
+# and wall-clock elapsed time is used instead.
 CALL_SERVICE_TIMEOUT_S: Final[float] = 3.0
 
 # 12 mel bins is plenty for a 2-zone bass/treble split; keeps the requested
