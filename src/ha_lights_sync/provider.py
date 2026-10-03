@@ -101,7 +101,19 @@ class HALightsSyncProvider(PluginProvider):
             return DEFAULT_BRIGHTNESS
 
     def get_light_entity_ids(self) -> list[str]:
-        value = self.config.get_value(CONF_LIGHT_ENTITIES)
+        """
+        Return the light entities picked in setup_flow.py.
+
+        Values collected via a setup flow's session.finish() land in the
+        provider's setup_data, not its regular config values - read back
+        via get_setup_value(), not config.get_value(). Mirrors Hue
+        Entertainment's own provider.py reading CONF_BRIDGE_HOST the same
+        way. Using config.get_value() here was the bug that let setup
+        "succeed" (the flow completed, the provider got created) while
+        silently persisting no light selection at all - see commit history
+        for the first (wrong) version of this method.
+        """
+        value = self.get_setup_value(CONF_LIGHT_ENTITIES)
         if isinstance(value, list):
             return [str(v) for v in value if v]
         return [str(value)] if value else []
