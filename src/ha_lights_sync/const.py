@@ -63,6 +63,14 @@ VISUALIZER_RATE_HZ: Final[int] = 8
 RENDER_RATE_HZ: Final[int] = 8
 RENDER_PERIOD_S: Final[float] = 1.0 / RENDER_RATE_HZ
 
+# Ceiling on one light.turn_on call. Well above the worst real round trip
+# measured during development (~220ms) - this exists purely as a backstop
+# against a call that never returns at all (seen in practice: a device/
+# integration wedging mid-call), which would otherwise jam _dispatch_send's
+# skip-if-pending guard permanently for that one entity. See bridge.py's
+# _send_command.
+CALL_SERVICE_TIMEOUT_S: Final[float] = 3.0
+
 # 12 mel bins is plenty for a 2-zone bass/treble split; keeps the requested
 # payload small. See music_assistant/providers/hue_entertainment/constants.py
 # for the prior art this mirrors (it uses 17 bins across its multi-channel

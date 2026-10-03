@@ -207,6 +207,39 @@ your existing setup.
    yet (the beat-tracking model takes a few seconds on a track's first
    play; instant on repeat plays).
 
+## Known limitations
+
+**The "HA Lights: &lt;name&gt;" player may be hidden by default.** If you
+don't see it in Music Assistant's main player list/switcher after setup,
+check Settings → Players → HA Lights: &lt;name&gt; → "Hide this player in
+the user interface" - uncheck it. It still exists and works either way;
+this only affects whether the picker surfaces it.
+
+**Grouping with a Chromecast/Google Home speaker can break that speaker's
+playback.** This isn't a bug in this plugin - it's a real limitation of
+Music Assistant's own Chromecast integration. Grouping *any* Sendspin-based
+player (this plugin, or the built-in Hue Lights Sync) with a Cast speaker
+requires switching that speaker from native Chromecast casting to MA's
+**"Sendspin over Cast"** output protocol, which MA itself ships
+experimental and off by default (Settings → Players → &lt;speaker&gt; →
+"Show advanced settings" → enable Sendspin there first, or grouping will
+silently do nothing). Confirmed during development: even with it enabled,
+grouping sometimes causes Music Assistant to immediately log
+`"<speaker> reported a media playback error"` and playback stops outright -
+MA switches the speaker's output protocol the instant you group, and the
+Cast device doesn't always pick up the new stream cleanly. If this happens
+to you:
+- It's worth testing with a non-Cast player (AirPlay, WiiM/LinkPlay, Sonos)
+  to confirm whether it's Cast-specific - AirPlay-based Sendspin bridging
+  appeared markedly more stable during development.
+- This plugin does guard against the *consequence* that showed up alongside
+  this for us (a wedged `light.turn_on` call permanently blocking that one
+  light's future updates - see `CALL_SERVICE_TIMEOUT_S` in `const.py`), but
+  it can't fix Music Assistant's own Cast/Sendspin bridge reliability.
+- File this upstream against `music-assistant/server`'s Chromecast provider
+  if you hit it, not this repo - there's nothing in `ha-lights-sync` that
+  can work around it.
+
 ## Configuration
 
 | Setting | Description |

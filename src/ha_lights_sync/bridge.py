@@ -51,6 +51,7 @@ from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROL
 
 from .analyzer import HALightsAudioAnalyzer
 from .const import (
+    CALL_SERVICE_TIMEOUT_S,
     RENDER_PERIOD_S,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
@@ -300,22 +301,41 @@ class HALightGroupBridge:
         # skip case above which is the thing worth a user's attention.
         start = time.monotonic()
         try:
-            await self._hass.call_service(
-                "light",
-                "turn_on",
-                service_data={
-                    "hs_color": [command.hue, command.saturation],
-                    "brightness_pct": command.brightness,
-                    # light.turn_on's transition is in seconds, unlike the
-                    # millisecond unit used everywhere else in this plugin
-                    # (matching python-kasa's/Hue's convention) - convert here,
-                    # at the one spot that actually calls the HA service.
-                    "transition": command.transition_ms / 1000.0,
-                },
-                target={"entity_id": entity_id},
+            # wait_for matters, not just a nicety: a call_service() that never
+            # returns (seen in practice when the underlying device/integration
+            # wedges - e.g. a Cast-group protocol switch disrupting the LAN
+            # the light sits on) would otherwise leave _pending_send[entity_id]
+            # "in flight" forever, permanently skipping every future render
+            # for that one entity until the bridge restarts. A stuck call is
+            # abandoned after CALL_SERVICE_TIMEOUT_S so the next render tick
+            # gets a clean shot at it instead.
+            await asyncio.wait_for(
+                self._hass.call_service(
+                    "light",
+                    "turn_on",
+                    service_data={
+                        "hs_color": [command.hue, command.saturation],
+                        "brightness_pct": command.brightness,
+                        # light.turn_on's transition is in seconds, unlike the
+                        # millisecond unit used everywhere else in this plugin
+                        # (matching python-kasa's/Hue's convention) - convert here,
+                        # at the one spot that actually calls the HA service.
+                        "transition": command.transition_ms / 1000.0,
+                    },
+                    target={"entity_id": entity_id},
+                ),
+                timeout=CALL_SERVICE_TIMEOUT_S,
             )
             elapsed_ms = round((time.monotonic() - start) * 1000)
             self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
+        except TimeoutError:
+            self.logger.warning(
+                "light.turn_on for %s did not respond within %.0fs - abandoning this send "
+                "so future renders aren't permanently blocked (the light or its integration "
+                "may be stuck)",
+                entity_id,
+                CALL_SERVICE_TIMEOUT_S,
+            )
         except Exception:
             self.logger.debug(
                 "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True
