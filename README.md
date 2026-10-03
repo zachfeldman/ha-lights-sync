@@ -296,6 +296,19 @@ you more than the fade softened the beat hits, `flashing` mode's own design
 with `instant`, since there's little continuous motion for the stepping to
 show up in.
 
+**Known hardware caveat:** TP-Link Kasa KL-series light strips (confirmed:
+KL420L5) **ignore the `transition` parameter entirely and always snap
+instantly**, regardless of what's sent - see
+[python-kasa#389](https://github.com/python-kasa/python-kasa/issues/389) and
+[home-assistant/core#57329](https://github.com/home-assistant/core/issues/57329),
+both still open/unresolved as of this writing. On these specific lights,
+`fade` vs `instant` makes **no visible difference** - the device was already
+behaving like `instant` the whole time. If a light you've grouped doesn't
+seem to respond to this setting, check whether its own integration has a
+similar known limitation before assuming this plugin is broken; other light
+brands/integrations (Hue, many Zigbee lights) do respect `transition`
+properly.
+
 ## Development
 
 ```bash

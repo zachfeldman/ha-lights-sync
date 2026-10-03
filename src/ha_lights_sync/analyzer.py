@@ -74,24 +74,34 @@ class _ModePreset:
     hue_beat_jump_deg: float
     # Saturation floor (0-1); bass energy pushes it up to 1.0 from here.
     saturation_floor: float
+    # How much the continuous bass-energy level lifts brightness ABOVE floor,
+    # separate from the on-beat flash (0-1). A sustained loud passage keeps
+    # resting brightness elevated at 1.0 (smooth/ambient's "swell" character,
+    # the original behavior), which also shrinks the contrast a beat flash
+    # reads with. Lower values hold resting brightness close to floor
+    # regardless of how loud the track currently is, so the flash itself -
+    # not the ongoing bass level - is what makes the light move. flashing
+    # uses this for genuine strobe-like contrast rather than "bright with a
+    # bump on top".
+    bass_weight: float = 1.0
 
 
 _PRESETS: dict[str, _ModePreset] = {
     "smooth": _ModePreset(
         floor=0.55, flash_strength=0.35, hue_drift_deg_s=6.0, hue_beat_jump_deg=15.0,
-        saturation_floor=0.7,
+        saturation_floor=0.7, bass_weight=1.0,
     ),
     "ambient": _ModePreset(
         floor=0.45, flash_strength=0.25, hue_drift_deg_s=3.0, hue_beat_jump_deg=40.0,
-        saturation_floor=0.4,
+        saturation_floor=0.4, bass_weight=1.0,
     ),
     "flashing": _ModePreset(
-        floor=0.2, flash_strength=1.0, hue_drift_deg_s=0.0, hue_beat_jump_deg=0.0,
-        saturation_floor=1.0,
+        floor=0.05, flash_strength=1.0, hue_drift_deg_s=0.0, hue_beat_jump_deg=0.0,
+        saturation_floor=1.0, bass_weight=0.15,
     ),
     "energetic": _ModePreset(
-        floor=0.3, flash_strength=0.8, hue_drift_deg_s=25.0, hue_beat_jump_deg=90.0,
-        saturation_floor=0.9,
+        floor=0.15, flash_strength=0.85, hue_drift_deg_s=25.0, hue_beat_jump_deg=90.0,
+        saturation_floor=0.9, bass_weight=0.5,
     ),
 }
 
@@ -251,7 +261,7 @@ class HALightsAudioAnalyzer:
             * max(0.0, 1.0 - flash_age / self._last_flash_decay_s)
         )
 
-        level = preset.floor + (1.0 - preset.floor) * self._bass.value + flash
+        level = preset.floor + (1.0 - preset.floor) * self._bass.value * preset.bass_weight + flash
         # brightness_ceiling is 0-100 (the configured cap); level is the 0-1+
         # fraction of it this instant renders at, clamped before scaling.
         brightness_pct = max(1, min(100, round(self.brightness_ceiling * _clamp01(level))))

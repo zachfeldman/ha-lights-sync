@@ -217,6 +217,16 @@ class HALightsSyncProvider(PluginProvider):
                 CONF_TRANSITION_STYLE,
             )
         }
+        # Logged at INFO (not just debug) while this is still new: confirms,
+        # for any given settings change, whether it actually took the live-
+        # apply path below or fell through to a full provider reload - the
+        # two are not visually distinguishable to a user just watching the
+        # lights, so this is the fast way to tell which happened.
+        self.logger.info(
+            "update_config called with changed_keys=%s (live-applicable=%s)",
+            changed_keys,
+            bool(changed_keys) and changed_keys <= settings_keys,
+        )
         if changed_keys and changed_keys <= settings_keys and self._bridge:
             self._bridge.update_settings(
                 color_mode=self.get_color_mode(),

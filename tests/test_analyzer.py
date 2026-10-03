@@ -193,3 +193,42 @@ def test_update_settings_ignores_invalid_transition_style() -> None:
     analyzer = HALightsAudioAnalyzer(transition_style="instant")
     analyzer.update_settings(transition_style="teleport")
     assert analyzer.transition_style == "instant"
+
+
+# -- flashing's strobe contrast (bass_weight) --
+
+
+def test_flashing_stays_dark_between_beats_even_under_loud_continuous_bass() -> None:
+    """
+    Regression guard for the "not really super flashing" tuning fix.
+
+    Before bass_weight existed, resting brightness rode the continuous bass
+    level up just like every other mode, so a loud sustained passage kept
+    flashing's "resting" state nearly as bright as its on-beat flash - no
+    real strobe contrast. flashing should stay close to its floor between
+    beats regardless of how loud the track currently is; smooth should not
+    (that continuous swell is its whole character).
+    """
+    flashing = HALightsAudioAnalyzer(color_mode="flashing", brightness=100)
+    smooth = HALightsAudioAnalyzer(color_mode="smooth", brightness=100)
+    for _ in range(20):
+        flashing.apply_spectrum([1.0] * 12)  # loud, continuous bass
+        smooth.apply_spectrum([1.0] * 12)
+
+    # No push_beats() call - this is deliberately the "between beats" case.
+    flashing_level = flashing.render(now_s=5.0).brightness
+    smooth_level = smooth.render(now_s=5.0).brightness
+    assert flashing_level < smooth_level
+
+
+@pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic"])
+def test_every_preset_flash_is_clearly_brighter_than_its_own_resting_level(mode: str) -> None:
+    """Every preset's on-beat flash should read as distinctly brighter than resting."""
+    analyzer = HALightsAudioAnalyzer(color_mode=mode, brightness=100)
+    for _ in range(10):
+        analyzer.apply_spectrum([0.4] * 12)
+    resting = analyzer.render(now_s=1.0).brightness
+
+    analyzer.push_beats([(2.0, False)])
+    at_beat = analyzer.render(now_s=2.0).brightness
+    assert at_beat > resting
