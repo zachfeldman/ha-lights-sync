@@ -31,10 +31,13 @@ from music_assistant.models.plugin import PluginProvider
 
 from .bridge import HALightGroupBridge
 from .const import (
+    BEAT_MULTIPLIERS,
+    CONF_BEAT_MULTIPLIER,
     CONF_BRIGHTNESS,
     CONF_COLOR_MODE,
     CONF_LIGHT_ENTITIES,
     COLOR_MODES,
+    DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
 )
@@ -87,6 +90,20 @@ class HALightsSyncProvider(PluginProvider):
                 range=(1, 100),
                 category="settings",
             ),
+            ConfigEntry(
+                key=CONF_BEAT_MULTIPLIER,
+                type=ConfigEntryType.INTEGER,
+                label="Speed",
+                description=(
+                    "Pulses per beat. 1x follows the track's real tempo exactly. 2x/4x "
+                    "insert evenly-spaced pulses between beats (softer than the real "
+                    "beat) for a faster feel - how crisp these look in practice depends "
+                    "on your lights' own response time, see the README's Speed section."
+                ),
+                default_value=DEFAULT_BEAT_MULTIPLIER,
+                options=[ConfigValueOption(n, title=f"{n}x") for n in BEAT_MULTIPLIERS],
+                category="settings",
+            ),
         )
 
     def get_color_mode(self) -> str:
@@ -99,6 +116,14 @@ class HALightsSyncProvider(PluginProvider):
             return max(1, min(100, int(value)))
         except (TypeError, ValueError):
             return DEFAULT_BRIGHTNESS
+
+    def get_beat_multiplier(self) -> int:
+        value = self.config.get_value(CONF_BEAT_MULTIPLIER)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_BEAT_MULTIPLIER
+        return value if value in BEAT_MULTIPLIERS else DEFAULT_BEAT_MULTIPLIER
 
     def get_light_entity_ids(self) -> list[str]:
         """
@@ -152,16 +177,20 @@ class HALightsSyncProvider(PluginProvider):
         """
         Handle config changes.
 
-        brightness/color_mode can be applied to the running bridge in place;
-        anything else (notably light_entities) falls through to the base
-        implementation, which reloads the provider - matches
-        HueEntertainmentProvider.update_config's split, see
+        brightness/color_mode/beat_multiplier can be applied to the running
+        bridge in place; anything else (notably light_entities) falls
+        through to the base implementation, which reloads the provider -
+        matches HueEntertainmentProvider.update_config's split, see
         music_assistant/providers/hue_entertainment/provider.py.
         """
-        settings_keys = {f"values/{key}" for key in (CONF_BRIGHTNESS, CONF_COLOR_MODE)}
+        settings_keys = {
+            f"values/{key}" for key in (CONF_BRIGHTNESS, CONF_COLOR_MODE, CONF_BEAT_MULTIPLIER)
+        }
         if changed_keys and changed_keys <= settings_keys and self._bridge:
             self._bridge.update_settings(
-                color_mode=self.get_color_mode(), brightness=self.get_brightness()
+                color_mode=self.get_color_mode(),
+                brightness=self.get_brightness(),
+                beat_multiplier=self.get_beat_multiplier(),
             )
             self.config = config
             return

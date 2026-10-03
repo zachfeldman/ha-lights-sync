@@ -9,6 +9,7 @@ from typing import Final
 CONF_LIGHT_ENTITIES: Final[str] = "light_entities"
 CONF_COLOR_MODE: Final[str] = "color_mode"
 CONF_BRIGHTNESS: Final[str] = "brightness"
+CONF_BEAT_MULTIPLIER: Final[str] = "beat_multiplier"
 CONF_HA_LATENCY_MS: Final[str] = "ha_latency_ms"
 
 # -- Visualization styles --
@@ -20,6 +21,18 @@ COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energet
 DEFAULT_COLOR_MODE: Final[str] = COLOR_MODES[0]
 
 DEFAULT_BRIGHTNESS: Final[int] = 100
+
+# -- Speed --
+#
+# Sendspin/smart_fades only ever gives us the real, tracked beat (1x). 2x/4x
+# are synthesized: evenly-spaced sub-beats inserted between each pair of real
+# beats (see analyzer.py's push_beats), pulsing softer than the real beat so
+# it still reads as the strongest hit. How crisp these look in practice is
+# capped by RENDER_RATE_HZ below and by real round-trip time to the physical
+# light - 4x on a fast track can ask for pulses closer together than either
+# can reliably keep up with; see README's Speed section.
+BEAT_MULTIPLIERS: Final[tuple[int, ...]] = (1, 2, 4)
+DEFAULT_BEAT_MULTIPLIER: Final[int] = BEAT_MULTIPLIERS[0]
 
 # How far ahead of "now" a render target is scheduled, to absorb command
 # round-trip time through Home Assistant's light.turn_on service (our own
@@ -37,8 +50,17 @@ DEFAULT_HA_LATENCY_MS: Final[int] = 150
 # uses to reach the physical light. Instead we request frames at a modest
 # rate and rely on the `transition` parameter (seconds) to interpolate
 # between them, so the light's own transition bridges each render period.
+#
+# 8Hz (125ms) rather than a more conservative rate because 2x/4x speed needs
+# the resolution to tell consecutive sub-beats apart - measured round trip
+# to real Kasa-via-HA hardware during development was 13-220ms (mostly
+# under 100ms), which mostly clears this budget but not always; a render
+# tick landing on top of a still-in-flight one is skipped rather than
+# queued (see bridge.py's _dispatch_send), so very fast songs at 4x can
+# still visibly skip a pulse here and there - that's a real hardware/
+# network ceiling, not a bug. Lower this if your logs show frequent skips.
 VISUALIZER_RATE_HZ: Final[int] = 8
-RENDER_RATE_HZ: Final[int] = 4
+RENDER_RATE_HZ: Final[int] = 8
 RENDER_PERIOD_S: Final[float] = 1.0 / RENDER_RATE_HZ
 
 # 12 mel bins is plenty for a 2-zone bass/treble split; keeps the requested

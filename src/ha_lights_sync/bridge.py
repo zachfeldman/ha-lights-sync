@@ -115,6 +115,7 @@ class HALightGroupBridge:
         self._analyzer = HALightsAudioAnalyzer(
             color_mode=self.provider.get_color_mode(),
             brightness=self.provider.get_brightness(),
+            beat_multiplier=self.provider.get_beat_multiplier(),
         )
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
@@ -187,10 +188,17 @@ class HALightGroupBridge:
         self._is_streaming = False
         self.logger.debug("HA Lights bridge stopped for '%s'", self.group_name)
 
-    def update_settings(self, color_mode: str | None = None, brightness: int | None = None) -> None:
+    def update_settings(
+        self,
+        color_mode: str | None = None,
+        brightness: int | None = None,
+        beat_multiplier: int | None = None,
+    ) -> None:
         """Update analyzer settings without restarting the bridge."""
         if self._analyzer:
-            self._analyzer.update_settings(color_mode=color_mode, brightness=brightness)
+            self._analyzer.update_settings(
+                color_mode=color_mode, brightness=brightness, beat_multiplier=beat_multiplier
+            )
 
     # -- Sendspin callbacks --
 
@@ -269,10 +277,14 @@ class HALightGroupBridge:
         """Fire the service call as a task, skipping if the previous send is still in flight."""
         pending = self._pending_send.get(entity_id)
         if pending is not None and not pending.done():
-            # TEMPORARY diagnostic (see _send_command) - tells us whether the
-            # render rate is actually being throttled by real round-trip time,
-            # which would explain fast songs feeling slower than they should.
-            self.logger.info("Skipped render for %s - previous send still in flight", entity_id)
+            # Logged at WARNING (not just debug) on purpose: a user tuning
+            # Speed up to 2x/4x needs an easy way to tell "my lights/network
+            # can't keep up with this setting" apart from "it's just not
+            # doing anything" - frequent skips here is the former, see
+            # README's Speed section.
+            self.logger.warning(
+                "Skipped render for %s - previous light.turn_on still in flight", entity_id
+            )
             return
         self._pending_send[entity_id] = self.mass.create_task(
             self._send_command(entity_id, command)
@@ -281,12 +293,11 @@ class HALightGroupBridge:
     async def _send_command(self, entity_id: str, command: LightCommand) -> None:
         if self._hass is None:
             return
-        # TEMPORARY diagnostic: log the actual light.turn_on round-trip time.
-        # If this regularly exceeds RENDER_PERIOD_S (250ms at the current
-        # RENDER_RATE_HZ=4), _dispatch_send's skip-if-pending guard would be
-        # silently dropping renders - which would look exactly like "the
-        # lights can't keep up with a fast song" even though the beat
-        # schedule itself is tempo-correct. Remove once we have real numbers.
+        # Round-trip time matters here, not just for curiosity: if it
+        # regularly exceeds RENDER_PERIOD_S, _dispatch_send's skip-if-pending
+        # guard above starts dropping renders - logged at DEBUG since this is
+        # the expected-success path (every render tick hits it), unlike the
+        # skip case above which is the thing worth a user's attention.
         start = time.monotonic()
         try:
             await self._hass.call_service(
@@ -304,7 +315,7 @@ class HALightGroupBridge:
                 target={"entity_id": entity_id},
             )
             elapsed_ms = round((time.monotonic() - start) * 1000)
-            self.logger.info("light.turn_on for %s took %dms", entity_id, elapsed_ms)
+            self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
         except Exception:
             self.logger.debug(
                 "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True

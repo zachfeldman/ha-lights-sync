@@ -214,6 +214,32 @@ your existing setup.
 | `light_entities` | The Home Assistant `light.*` entities this group drives. Multi-select, populated live from Home Assistant - any light already set up there is selectable. |
 | `color_mode` | `smooth` (gentle, beat-tinted color drift), `ambient` (slower, bass-reactive saturation), `flashing` (strong pulse every beat), `energetic` (big brightness swings, fast color rotation). |
 | `brightness` | 1–100, the ceiling this group renders up to. |
+| `beat_multiplier` ("Speed") | `1x`, `2x`, or `4x` pulses per beat (see below). |
+
+All four settings apply to the running bridge immediately on save - no
+restart, no re-grouping needed.
+
+### Speed (`beat_multiplier`)
+
+The beat schedule Sendspin delivers is the track's real, tracked tempo - 1x
+*is* the song's actual BPM, not an approximation. 2x and 4x aren't a
+different analysis; they're synthesized by inserting 1 (2x) or 3 (4x)
+evenly-spaced pulses between each pair of real beats, pulsing softer than
+the real beat so the actual downbeat still reads as the strongest hit
+(`_SUBBEAT_STRENGTH` in `analyzer.py`).
+
+How crisp this looks in practice has a real ceiling, and it's not this
+plugin's render loop (`RENDER_RATE_HZ` in `const.py` is 8Hz/125ms,
+specifically sized to resolve 2x/4x subdivisions) - it's the round trip
+through Home Assistant to your actual light. Measured against real TP-Link
+Kasa strips during development: 13-220ms, mostly under 100ms. At 4x on a
+fast track, sub-beats can land closer together than that round trip allows,
+and `bridge.py` deliberately **skips** a render rather than queuing it (so
+commands never arrive out of order) - logged as a `WARNING`
+("Skipped render for ... - previous light.turn_on still in flight"). A few
+of these on a very fast 4x track is normal; constant skipping means your
+light/network is the bottleneck, not a setting to tune away here - try 2x
+instead, or a less chatty light integration.
 
 ## Development
 
