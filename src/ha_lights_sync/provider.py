@@ -7,11 +7,13 @@ with a real player in the Music Assistant UI the same way you'd group a Hue
 Lights Sync player, and the configured lights react to whatever that player
 plays.
 
-The light picker below is populated live from Home Assistant's own entity
-states via `mass.get_provider("hass")` - the same connection Music
-Assistant's built-in "Home Assistant" plugin already maintains. There is
-nothing else to set up: no device IPs, no separate pairing. If a light is
-already in Home Assistant, it shows up here.
+Which lights this group drives is picked interactively in setup_flow.py (a
+dedicated form, prefilled from Home Assistant's own live entity list via
+`mass.get_provider("hass")`) rather than here - that field has no sensible
+default, so it needs the same kind of must-fill-this-in interactive step
+Hue Entertainment's bridge pairing uses, not a regular (optional-feeling)
+config entry. See setup_flow.py's docstring for why that distinction
+matters in practice, not just in theory.
 
 Add the provider again (manifest declares multi_instance: true) for a second
 independently-configured room/group.
@@ -61,22 +63,16 @@ class HALightsSyncProvider(PluginProvider):
         self._bridge: HALightGroupBridge | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Return the (options) config entries for this provider instance."""
+        """
+        Return the (options) config entries for this provider instance.
+
+        light_entities is deliberately absent here - it's collected by
+        setup_flow.py instead. These two are the settings that DO have a
+        sensible default and stay editable any time after setup, same as
+        Hue Entertainment's brightness/color_mode (its bridge pairing is
+        likewise setup_flow-only, not repeated here).
+        """
         return (
-            ConfigEntry(
-                key=CONF_LIGHT_ENTITIES,
-                type=ConfigEntryType.STRING,
-                label="Light(s)",
-                description=(
-                    "The Home Assistant light entities this group should drive. Pulled "
-                    "live from Home Assistant - if a light is already set up there "
-                    "(any brand/integration), it's selectable here, no extra setup needed."
-                ),
-                required=True,
-                multi_value=True,
-                options=await self._light_entity_options(),
-                category="settings",
-            ),
             ConfigEntry(
                 key=CONF_COLOR_MODE,
                 type=ConfigEntryType.STRING,
@@ -92,38 +88,6 @@ class HALightsSyncProvider(PluginProvider):
                 category="settings",
             ),
         )
-
-    async def _light_entity_options(self) -> list[ConfigValueOption]:
-        """
-        Return every light.* entity Home Assistant currently knows about.
-
-        Empty (rather than raising) when the Home Assistant plugin isn't
-        loaded/connected yet, so the config screen still renders - with a
-        clear "nothing to pick" state - instead of failing to open at all.
-        """
-        hass_provider = self.mass.get_provider("hass")
-        hass = getattr(hass_provider, "hass", None) if hass_provider else None
-        if hass is None:
-            self.logger.warning(
-                "Home Assistant plugin not loaded/connected - add and configure it first "
-                "(Settings -> Add Provider -> Home Assistant) to pick lights here"
-            )
-            return []
-        try:
-            states = await hass.get_states()
-        except Exception:
-            self.logger.exception("Could not fetch light entities from Home Assistant")
-            return []
-        options = [
-            ConfigValueOption(
-                state["entity_id"],
-                title=state["attributes"].get("friendly_name", state["entity_id"]),
-            )
-            for state in states
-            if state["entity_id"].startswith("light.")
-        ]
-        options.sort(key=lambda opt: opt.title.casefold())
-        return options
 
     def get_color_mode(self) -> str:
         value = self.config.get_value(CONF_COLOR_MODE)
