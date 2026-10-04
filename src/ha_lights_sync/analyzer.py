@@ -28,6 +28,7 @@ from .const import (
     DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
+    DEFAULT_SENSITIVITY,
     DEFAULT_TRANSITION_STYLE,
     RENDER_PERIOD_S,
     TRANSITION_STYLES,
@@ -84,6 +85,13 @@ class _ModePreset:
     # uses this for genuine strobe-like contrast rather than "bright with a
     # bump on top".
     bass_weight: float = 1.0
+    # When True, the continuous brightness driver above is the full-spectrum
+    # overall loudness level (self._overall, all bins) instead of the
+    # bass-only band (self._bass, bottom third of bins) - i.e. "track the
+    # music's general volume", not "track the bass specifically". Only
+    # "pulse" uses this; every other preset keeps the original bass-driven
+    # behavior unchanged.
+    use_overall_level: bool = False
 
 
 _PRESETS: dict[str, _ModePreset] = {
@@ -102,6 +110,17 @@ _PRESETS: dict[str, _ModePreset] = {
     "energetic": _ModePreset(
         floor=0.15, flash_strength=0.85, hue_drift_deg_s=25.0, hue_beat_jump_deg=90.0,
         saturation_floor=0.9, bass_weight=0.5,
+    ),
+    # Brightness-first: no beat flash and no beat-driven hue jump at all
+    # (flash_strength=0, hue_beat_jump_deg=0) so the ONLY thing that moves
+    # brightness is the continuous overall-loudness level, at full weight
+    # (bass_weight=1.0, use_overall_level=True) with a low floor so the
+    # swing from quiet to loud passages is as visible as possible. A slow
+    # hue drift keeps it from looking static without competing with the
+    # brightness-tracks-music effect that's the whole point of this mode.
+    "pulse": _ModePreset(
+        floor=0.08, flash_strength=0.0, hue_drift_deg_s=8.0, hue_beat_jump_deg=0.0,
+        saturation_floor=0.75, bass_weight=1.0, use_overall_level=True,
     ),
 }
 
@@ -146,6 +165,7 @@ class HALightsAudioAnalyzer:
         brightness: int = DEFAULT_BRIGHTNESS,
         beat_multiplier: int = DEFAULT_BEAT_MULTIPLIER,
         transition_style: str = DEFAULT_TRANSITION_STYLE,
+        sensitivity: int = DEFAULT_SENSITIVITY,
     ) -> None:
         self.color_mode = color_mode if color_mode in COLOR_MODES else DEFAULT_COLOR_MODE
         self.brightness_ceiling = brightness
@@ -153,8 +173,12 @@ class HALightsAudioAnalyzer:
         self.transition_style = (
             transition_style if transition_style in TRANSITION_STYLES else DEFAULT_TRANSITION_STYLE
         )
+        # Stored as a plain multiplier (sensitivity is a percent at the
+        # config/analyzer boundary - see const.py's DEFAULT_SENSITIVITY).
+        self._sensitivity = max(0.0, sensitivity / 100.0)
         self._bass = _ExpFilter(alpha_rise=0.6, alpha_decay=0.08, initial=0.0)
         self._treble = _ExpFilter(alpha_rise=0.5, alpha_decay=0.1, initial=0.0)
+        self._overall = _ExpFilter(alpha_rise=0.6, alpha_decay=0.08, initial=0.0)
         self._beats: list[_ScheduledBeat] = []
         self._last_beat_flash_s: float = -10.0
         self._last_flash_strength: float = 1.0
@@ -168,6 +192,7 @@ class HALightsAudioAnalyzer:
         brightness: int | None = None,
         beat_multiplier: int | None = None,
         transition_style: str | None = None,
+        sensitivity: int | None = None,
     ) -> None:
         if color_mode is not None and color_mode in COLOR_MODES:
             self.color_mode = color_mode
@@ -177,10 +202,12 @@ class HALightsAudioAnalyzer:
             self.beat_multiplier = beat_multiplier
         if transition_style is not None and transition_style in TRANSITION_STYLES:
             self.transition_style = transition_style
+        if sensitivity is not None:
+            self._sensitivity = max(0.0, sensitivity / 100.0)
 
     def apply_spectrum(self, bins: list[float]) -> None:
         """
-        Fold a binned spectrum frame into smoothed bass/treble energy.
+        Fold a binned spectrum frame into smoothed bass/treble/overall energy.
 
         :param bins: Magnitude per mel bin, low frequency first (see
             SPECTRUM_BINS/SPECTRUM_SCALE in const.py for the request shape).
@@ -190,8 +217,14 @@ class HALightsAudioAnalyzer:
         split = max(1, len(bins) // 3)
         bass_raw = sum(bins[:split]) / split
         treble_raw = sum(bins[-split:]) / split
-        self._bass.update(_clamp01(bass_raw))
-        self._treble.update(_clamp01(treble_raw))
+        overall_raw = sum(bins) / len(bins)
+        # Sensitivity amplifies the raw magnitude BEFORE clamping to 0-1, so
+        # quiet playback (every bin sitting well under 1.0) can still drive
+        # the smoothed levels up near their ceiling instead of staying
+        # perpetually muted - see const.py's DEFAULT_SENSITIVITY docstring.
+        self._bass.update(_clamp01(bass_raw * self._sensitivity))
+        self._treble.update(_clamp01(treble_raw * self._sensitivity))
+        self._overall.update(_clamp01(overall_raw * self._sensitivity))
 
     def push_beats(self, beats_s: list[tuple[float, bool]]) -> None:
         """
@@ -261,7 +294,8 @@ class HALightsAudioAnalyzer:
             * max(0.0, 1.0 - flash_age / self._last_flash_decay_s)
         )
 
-        level = preset.floor + (1.0 - preset.floor) * self._bass.value * preset.bass_weight + flash
+        level_source = self._overall.value if preset.use_overall_level else self._bass.value
+        level = preset.floor + (1.0 - preset.floor) * level_source * preset.bass_weight + flash
         # brightness_ceiling is 0-100 (the configured cap); level is the 0-1+
         # fraction of it this instant renders at, clamped before scaling.
         brightness_pct = max(1, min(100, round(self.brightness_ceiling * _clamp01(level))))

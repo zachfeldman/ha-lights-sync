@@ -12,16 +12,35 @@ CONF_BRIGHTNESS: Final[str] = "brightness"
 CONF_BEAT_MULTIPLIER: Final[str] = "beat_multiplier"
 CONF_TRANSITION_STYLE: Final[str] = "transition_style"
 CONF_HA_LATENCY_MS: Final[str] = "ha_latency_ms"
+CONF_SENSITIVITY: Final[str] = "sensitivity"
 
 # -- Visualization styles --
 #
 # Named to match Music Assistant's built-in Hue Lights Sync plugin so the
 # concepts carry over for anyone who has used that one. First entry is the
-# default.
-COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energetic")
+# default. "pulse" is the odd one out - its whole point is brightness
+# continuously tracking overall loudness and nothing else (no beat flash,
+# no hue jump) - see analyzer.py's _ModePreset.use_overall_level.
+COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energetic", "pulse")
 DEFAULT_COLOR_MODE: Final[str] = COLOR_MODES[0]
 
 DEFAULT_BRIGHTNESS: Final[int] = 100
+
+# -- Sensitivity --
+#
+# A plain gain multiplier on the raw spectrum magnitude, applied before it's
+# clamped into bass/treble/overall energy (see analyzer.py's apply_spectrum).
+# Exists because the analyzer has no idea how loud the room actually is -
+# Sendspin hands it magnitudes computed from whatever the track's own mix/
+# mastering level and the player's current volume happen to be, so quieter
+# listening (or a quietly-mastered track) can sit well under 1.0 on every
+# bin, muting every mode's swell/flash contrast even though beats are still
+# tracked correctly - beat timestamps come from Sendspin's own tempo
+# tracking, not from this magnitude, so they're unaffected by this setting
+# (see push_beats). Stored as a percent (matching this plugin's other
+# integer config entries) and divided by 100 where it's actually applied.
+DEFAULT_SENSITIVITY: Final[int] = 100
+SENSITIVITY_RANGE: Final[tuple[int, int]] = (25, 400)
 
 # -- Speed --
 #
@@ -94,3 +113,27 @@ SPECTRUM_BINS: Final[int] = 12
 SPECTRUM_SCALE: Final = "mel"
 SPECTRUM_F_MIN: Final[int] = 20
 SPECTRUM_F_MAX: Final[int] = 20000
+
+# -- Per-entity adaptive pacing --
+#
+# Not every light in a group answers light.turn_on at the same speed - a
+# slow/laggy device (e.g. a cheap Wi-Fi LED strip a few hops from the HA
+# host) sharing a group with a fast one (e.g. a local Zigbee bulb) used to
+# get hammered at the same RENDER_RATE_HZ as the fast one, producing
+# constant "previous light.turn_on still in flight" skips and arguably
+# making the slow light look worse than if it were just paced to what it
+# can actually keep up with. Rather than requiring the user to manually
+# mark a light as "slow" (a new per-entity setup step), each entity's own
+# recent round-trip time is tracked (see bridge.py's _entity_latency_ms)
+# and used to automatically widen its minimum inter-send gap beyond the
+# shared RENDER_PERIOD_S once it's shown it needs that - so it still reacts
+# to every beat, just at whatever pace it can actually sustain, without
+# starving faster lights in the same group of their full render rate.
+#
+# Multiplier applied to an entity's own observed typical round-trip before
+# using it as that entity's minimum gap between sends - gives it headroom
+# to finish comfortably rather than pacing it right at the ragged edge of
+# its last measured time.
+ENTITY_LATENCY_SAFETY_FACTOR: Final[float] = 1.3
+# How fast the per-entity round-trip estimate adapts to new samples.
+ENTITY_LATENCY_EMA_ALPHA: Final[float] = 0.3

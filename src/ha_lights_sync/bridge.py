@@ -52,6 +52,8 @@ from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROL
 from .analyzer import HALightsAudioAnalyzer
 from .const import (
     CALL_SERVICE_TIMEOUT_S,
+    ENTITY_LATENCY_EMA_ALPHA,
+    ENTITY_LATENCY_SAFETY_FACTOR,
     RENDER_PERIOD_S,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
@@ -102,6 +104,13 @@ class HALightGroupBridge:
         # notion of being "done" - see _dispatch_send for why this is the
         # thing that actually guarantees forward progress, not task.cancel().
         self._pending_send_started_at: dict[str, float] = {}
+        # Per-entity round-trip EMA (ms), used to pace each light to its own
+        # realistic speed rather than the shared render rate - see
+        # _dispatch_send and const.py's "Per-entity adaptive pacing" note.
+        # Seeded lazily (first real sample replaces the implicit "not slower
+        # than the base render rate" assumption) rather than pre-filled, so
+        # a light that's never been measured isn't throttled on a guess.
+        self._entity_latency_ms: dict[str, float] = {}
         self._sendspin_client: SendspinClient | None = None
         self._is_streaming = False
         self._stop_debounce_task: asyncio.Task[None] | None = None
@@ -122,6 +131,7 @@ class HALightGroupBridge:
             brightness=self.provider.get_brightness(),
             beat_multiplier=self.provider.get_beat_multiplier(),
             transition_style=self.provider.get_transition_style(),
+            sensitivity=self.provider.get_sensitivity(),
         )
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
@@ -200,6 +210,7 @@ class HALightGroupBridge:
         brightness: int | None = None,
         beat_multiplier: int | None = None,
         transition_style: str | None = None,
+        sensitivity: int | None = None,
     ) -> None:
         """Update analyzer settings without restarting the bridge."""
         if self._analyzer:
@@ -208,6 +219,7 @@ class HALightGroupBridge:
                 brightness=brightness,
                 beat_multiplier=beat_multiplier,
                 transition_style=transition_style,
+                sensitivity=sensitivity,
             )
 
     # -- Sendspin callbacks --
@@ -285,19 +297,38 @@ class HALightGroupBridge:
 
     def _dispatch_send(self, entity_id: str, command: LightCommand) -> None:
         """
-        Fire the service call as a task, skipping if the previous send is still in flight.
+        Fire the service call as a task, pacing each entity to its own realistic speed.
 
-        Whether a previous send counts as "still in flight" is decided by
-        wall-clock time since it was dispatched, NOT by asyncio.Task.cancel()/
-        done(). Confirmed the hard way: a call_service() that wedges deep
-        inside hass_client/aiohttp can sit "pending" indefinitely even after
-        being cancelled - cancellation only takes effect where the coroutine
-        actually yields, and a wedged one may never yield again. A timeout
-        wrapped around the await (an earlier version of this method used
-        asyncio.wait_for) inherits that same failure mode: it was observed
-        sitting stuck for 4+ minutes with zero timeout ever firing. Elapsed
-        wall-clock time can't be defeated this way, so it - not task state -
-        is what decides whether a new send goes out.
+        Two independent reasons a render tick might NOT send a fresh command
+        to this entity right now:
+
+        1. The previous send for it hasn't finished yet (whether "finished"
+           counts is decided by wall-clock time since dispatch, NOT by
+           asyncio.Task.cancel()/done() - see the stuck-call note below).
+        2. It HAS finished, but finished recently enough that sending again
+           now would just repeat the "slow light getting hammered" problem
+           in a different guise - see _entity_latency_ms/
+           ENTITY_LATENCY_SAFETY_FACTOR. This is what lets a light with a
+           genuinely slower round trip (e.g. a laggy Wi-Fi strip sharing a
+           group with a fast Zigbee bulb) settle into whatever cadence it
+           can actually sustain - still reacting to every beat, just not at
+           the full shared render rate - instead of either starving faster
+           lights in the same group to match its pace, or constantly
+           skipping sends for it and logging warnings about something that
+           isn't actually a problem.
+
+        Stuck-call note: whether a previous send counts as "still in
+        flight" is decided by wall-clock time since it was dispatched, NOT
+        by asyncio.Task.cancel()/done(). Confirmed the hard way: a
+        call_service() that wedges deep inside hass_client/aiohttp can sit
+        "pending" indefinitely even after being cancelled - cancellation
+        only takes effect where the coroutine actually yields, and a
+        wedged one may never yield again. A timeout wrapped around the
+        await (an earlier version of this method used asyncio.wait_for)
+        inherits that same failure mode: it was observed sitting stuck for
+        4+ minutes with zero timeout ever firing. Elapsed wall-clock time
+        can't be defeated this way, so it - not task state - is what
+        decides whether a new send goes out.
         """
         pending = self._pending_send.get(entity_id)
         started_at = self._pending_send_started_at.get(entity_id)
@@ -323,6 +354,19 @@ class HALightGroupBridge:
                     "Skipped render for %s - previous light.turn_on still in flight", entity_id
                 )
                 return
+        else:
+            # Previous send (if any) already completed - but if THIS entity
+            # has shown it typically takes meaningfully longer than the
+            # shared render period, don't immediately re-fire just because
+            # the task object is technically done; give it the breathing
+            # room its own measured pace calls for. Unmeasured entities (no
+            # EMA sample yet) fall through unthrottled here - RENDER_PERIOD_S
+            # is already enforced by the render loop's own tick interval.
+            typical_ms = self._entity_latency_ms.get(entity_id)
+            if typical_ms is not None and age_s is not None:
+                min_gap_s = max(RENDER_PERIOD_S, (typical_ms / 1000.0) * ENTITY_LATENCY_SAFETY_FACTOR)
+                if age_s < min_gap_s:
+                    return
         self._pending_send_started_at[entity_id] = time.monotonic()
         self._pending_send[entity_id] = self.mass.create_task(
             self._send_command(entity_id, command)
@@ -352,6 +396,15 @@ class HALightGroupBridge:
             )
             elapsed_ms = round((time.monotonic() - start) * 1000)
             self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
+            # Only successful, non-stuck calls feed the pacing estimate - a
+            # single stuck/failed call (handled separately above/below)
+            # shouldn't permanently convince us this entity is slower than
+            # it normally is off one bad sample.
+            prev = self._entity_latency_ms.get(entity_id)
+            self._entity_latency_ms[entity_id] = (
+                elapsed_ms if prev is None
+                else prev + ENTITY_LATENCY_EMA_ALPHA * (elapsed_ms - prev)
+            )
         except asyncio.CancelledError:
             # Raised into us by _dispatch_send's best-effort pending.cancel()
             # above, potentially long after this coroutine actually wedged -

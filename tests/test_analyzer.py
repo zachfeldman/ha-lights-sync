@@ -74,7 +74,7 @@ def test_unknown_color_mode_falls_back_to_default() -> None:
     assert analyzer.color_mode == "smooth"
 
 
-@pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic"])
+@pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic", "pulse"])
 def test_every_preset_renders_without_error(mode: str) -> None:
     analyzer = HALightsAudioAnalyzer(color_mode=mode, brightness=100)
     analyzer.apply_spectrum([0.3] * 12)
@@ -223,7 +223,13 @@ def test_flashing_stays_dark_between_beats_even_under_loud_continuous_bass() -> 
 
 @pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic"])
 def test_every_preset_flash_is_clearly_brighter_than_its_own_resting_level(mode: str) -> None:
-    """Every preset's on-beat flash should read as distinctly brighter than resting."""
+    """
+    Every preset's on-beat flash should read as distinctly brighter than resting.
+
+    "pulse" is deliberately excluded - its whole point is brightness driven
+    purely by continuous overall loudness with flash_strength=0 (no beat
+    flash at all), see test_pulse_mode_has_no_beat_flash below.
+    """
     analyzer = HALightsAudioAnalyzer(color_mode=mode, brightness=100)
     for _ in range(10):
         analyzer.apply_spectrum([0.4] * 12)
@@ -232,3 +238,80 @@ def test_every_preset_flash_is_clearly_brighter_than_its_own_resting_level(mode:
     analyzer.push_beats([(2.0, False)])
     at_beat = analyzer.render(now_s=2.0).brightness
     assert at_beat > resting
+
+
+# -- Sensitivity --
+
+
+def test_sensitivity_amplifies_a_quiet_signal() -> None:
+    quiet_default = HALightsAudioAnalyzer(color_mode="smooth", brightness=100, sensitivity=100)
+    quiet_boosted = HALightsAudioAnalyzer(color_mode="smooth", brightness=100, sensitivity=300)
+
+    # Same, deliberately quiet input to both.
+    for _ in range(15):
+        quiet_default.apply_spectrum([0.1] * 12)
+        quiet_boosted.apply_spectrum([0.1] * 12)
+
+    default_brightness = quiet_default.render(now_s=2.0).brightness
+    boosted_brightness = quiet_boosted.render(now_s=2.0).brightness
+    assert boosted_brightness > default_brightness
+
+
+def test_update_settings_changes_sensitivity() -> None:
+    analyzer = HALightsAudioAnalyzer(sensitivity=100)
+    analyzer.update_settings(sensitivity=250)
+    assert analyzer._sensitivity == pytest.approx(2.5)  # noqa: SLF001
+
+
+def test_default_sensitivity_is_unity_gain() -> None:
+    # 100% should be a no-op multiplier - confirms the default doesn't
+    # silently change behavior for anyone who never touches this setting.
+    analyzer = HALightsAudioAnalyzer(sensitivity=100)
+    analyzer.apply_spectrum([0.5] * 12)
+    assert analyzer._bass.value == pytest.approx(0.5 * 0.6)  # noqa: SLF001 - one EMA step from 0
+
+
+# -- Pulse mode (brightness tracks overall loudness) --
+
+
+def test_pulse_mode_has_no_beat_flash() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="pulse", brightness=100)
+    for _ in range(10):
+        analyzer.apply_spectrum([0.4] * 12)
+    resting = analyzer.render(now_s=1.0).brightness
+
+    analyzer.push_beats([(2.0, False)])
+    at_beat = analyzer.render(now_s=2.0).brightness
+    assert at_beat == resting
+
+
+def test_pulse_mode_tracks_overall_level_not_just_bass() -> None:
+    """
+    pulse should react to loud mid/treble content even with zero bass -
+    the thing that distinguishes it from smooth/ambient/energetic, which
+    only ever look at the bass band (see _ModePreset.use_overall_level).
+    """
+    pulse = HALightsAudioAnalyzer(color_mode="pulse", brightness=100)
+    smooth = HALightsAudioAnalyzer(color_mode="smooth", brightness=100)
+
+    # Zero bass (first third of bins), loud everything else.
+    bins = [0.0, 0.0, 0.0, 0.0] + [1.0] * 8
+    for _ in range(15):
+        pulse.apply_spectrum(bins)
+        smooth.apply_spectrum(bins)
+
+    pulse_brightness = pulse.render(now_s=2.0).brightness
+    smooth_brightness = smooth.render(now_s=2.0).brightness
+    assert pulse_brightness > smooth_brightness
+
+
+def test_pulse_mode_brightness_rises_and_falls_with_overall_level() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="pulse", brightness=100)
+    for _ in range(15):
+        analyzer.apply_spectrum([0.0] * 12)
+    quiet_brightness = analyzer.render(now_s=1.0).brightness
+
+    for _ in range(15):
+        analyzer.apply_spectrum([1.0] * 12)
+    loud_brightness = analyzer.render(now_s=2.0).brightness
+    assert loud_brightness > quiet_brightness

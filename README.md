@@ -209,8 +209,9 @@ your existing setup.
 
 ### Changing which lights are in the group later
 
-`color_mode`/`brightness`/`beat_multiplier`/`transition_style` are regular
-settings, editable any time from the provider's own settings screen. Which
+`color_mode`/`brightness`/`beat_multiplier`/`transition_style`/`sensitivity`
+are regular settings, editable any time from the provider's own settings
+screen. Which
 *lights* are in the group is different - that's collected by the
 interactive setup flow (see `setup_flow.py`), not a regular setting, so
 editing it goes through Music Assistant's generic **Reconfigure** action
@@ -280,13 +281,43 @@ to you:
 | Setting | Description |
 |---|---|
 | `light_entities` | The Home Assistant `light.*` entities this group drives. Multi-select, populated live from Home Assistant - any light already set up there is selectable. |
-| `color_mode` | `smooth` (gentle, beat-tinted color drift), `ambient` (slower, bass-reactive saturation), `flashing` (strong pulse every beat), `energetic` (big brightness swings, fast color rotation). |
+| `color_mode` | `smooth` (gentle, beat-tinted color drift), `ambient` (slower, bass-reactive saturation), `flashing` (strong pulse every beat), `energetic` (big brightness swings, fast color rotation), `pulse` (brightness continuously tracks the music's overall loudness, no beat flash - see below). |
 | `brightness` | 1–100, the ceiling this group renders up to. |
 | `beat_multiplier` ("Speed") | `1x`, `2x`, or `4x` pulses per beat (see below). |
 | `transition_style` ("Transition style") | `fade` (default, eases between colors/brightness) or `instant` (hard, un-eased cut on every update - see below). |
+| `sensitivity` ("Sensitivity") | 25–400%, default 100%. Gain on the detected audio signal itself - see below. Distinct from Speed, which only changes pulse *frequency*, not signal *strength*. |
 
-All five settings apply to the running bridge immediately on save - no
+All six settings apply to the running bridge immediately on save - no
 restart, no re-grouping needed.
+
+### Pulse mode
+
+Every other `color_mode` is built around a beat flash on top of a resting
+brightness. `pulse` drops the beat flash entirely
+(`flash_strength=0`/`hue_beat_jump_deg=0` in `analyzer.py`'s `_PRESETS`) and
+instead ties brightness directly and continuously to the track's overall
+loudness across the *whole* spectrum, not just the bass band the other
+modes watch (`_ModePreset.use_overall_level` - see `apply_spectrum`'s
+`self._overall`, a full-bin average alongside the existing bass/treble
+split). The result reads like a classic VU meter: brightness rises and
+falls smoothly with how loud the music currently is, with a slow hue drift
+so it doesn't look static, rather than pulsing on individual beats.
+
+### Sensitivity
+
+The analyzer has no idea how loud your room actually is - Sendspin hands it
+spectrum magnitudes computed from whatever level the track happens to be
+mixed/mastered at and wherever your volume happens to be set, so quieter
+listening can leave every bin sitting well under 1.0, muting every mode's
+swell/flash contrast even though beats are still being tracked correctly.
+`sensitivity` is a plain gain multiplier applied to the raw spectrum
+magnitude *before* it's clamped into the smoothed bass/treble/overall
+levels (`apply_spectrum` in `analyzer.py`) - raise it if the lights look
+washed-out/barely reactive at your normal listening volume. It has no effect
+on beat timing at all: beat timestamps come from Sendspin's own tempo
+tracking, a separate signal from the spectrum magnitude this setting scales
+(see `push_beats`) - that's what makes it a genuinely different knob from
+Speed (`beat_multiplier`), which only changes how often pulses fire.
 
 ### Speed (`beat_multiplier`)
 
@@ -309,6 +340,18 @@ commands never arrive out of order) - logged as a `WARNING`
 of these on a very fast 4x track is normal; constant skipping means your
 light/network is the bottleneck, not a setting to tune away here - try 2x
 instead, or a less chatty light integration.
+
+**Mixed-speed groups are handled automatically.** If one light in a group is
+consistently slower to respond than the others (a laggy Wi-Fi strip grouped
+with a fast Zigbee bulb, say), `bridge.py` tracks each entity's own recent
+round-trip time independently and paces that specific entity to whatever it
+can actually sustain, rather than either holding the whole group back to
+match it or hammering it at the full shared render rate and constantly
+logging skips for it (`_entity_latency_ms`/`ENTITY_LATENCY_SAFETY_FACTOR` in
+`const.py`/`bridge.py`). It still reacts to every beat - just at its own
+realistic pace - while faster lights in the same group keep rendering at the
+full rate. This is automatic and needs no configuration; there's no "light
+class" setting to pick, it adapts from real measured timing.
 
 ### Transition style (`transition_style`)
 

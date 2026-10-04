@@ -36,12 +36,15 @@ from .const import (
     CONF_BRIGHTNESS,
     CONF_COLOR_MODE,
     CONF_LIGHT_ENTITIES,
+    CONF_SENSITIVITY,
     CONF_TRANSITION_STYLE,
     COLOR_MODES,
     DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
+    DEFAULT_SENSITIVITY,
     DEFAULT_TRANSITION_STYLE,
+    SENSITIVITY_RANGE,
     TRANSITION_STYLES,
 )
 
@@ -124,6 +127,20 @@ class HALightsSyncProvider(PluginProvider):
                 ],
                 category="settings",
             ),
+            ConfigEntry(
+                key=CONF_SENSITIVITY,
+                type=ConfigEntryType.INTEGER,
+                label="Sensitivity",
+                description=(
+                    "Amplifies the detected audio signal itself, as a percent - distinct "
+                    "from Speed (which only changes how often pulses fire, not how strong "
+                    "they look). Raise this if quieter listening volumes make the lights "
+                    "look washed-out/barely reactive; 100% is unmodified."
+                ),
+                default_value=DEFAULT_SENSITIVITY,
+                range=SENSITIVITY_RANGE,
+                category="settings",
+            ),
         )
 
     def get_color_mode(self) -> str:
@@ -148,6 +165,14 @@ class HALightsSyncProvider(PluginProvider):
     def get_transition_style(self) -> str:
         value = self.config.get_value(CONF_TRANSITION_STYLE)
         return str(value) if value in TRANSITION_STYLES else DEFAULT_TRANSITION_STYLE
+
+    def get_sensitivity(self) -> int:
+        value = self.config.get_value(CONF_SENSITIVITY)
+        try:
+            lo, hi = SENSITIVITY_RANGE
+            return max(lo, min(hi, int(value)))
+        except (TypeError, ValueError):
+            return DEFAULT_SENSITIVITY
 
     def get_light_entity_ids(self) -> list[str]:
         """
@@ -215,6 +240,7 @@ class HALightsSyncProvider(PluginProvider):
                 CONF_COLOR_MODE,
                 CONF_BEAT_MULTIPLIER,
                 CONF_TRANSITION_STYLE,
+                CONF_SENSITIVITY,
             )
         }
         # Logged at INFO (not just debug) while this is still new: confirms,
@@ -233,6 +259,7 @@ class HALightsSyncProvider(PluginProvider):
                 brightness=self.get_brightness(),
                 beat_multiplier=self.get_beat_multiplier(),
                 transition_style=self.get_transition_style(),
+                sensitivity=self.get_sensitivity(),
             )
             self.config = config
             return
