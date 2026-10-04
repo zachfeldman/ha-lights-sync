@@ -207,6 +207,19 @@ your existing setup.
    yet (the beat-tracking model takes a few seconds on a track's first
    play; instant on repeat plays).
 
+### Changing which lights are in the group later
+
+`color_mode`/`brightness`/`beat_multiplier`/`transition_style` are regular
+settings, editable any time from the provider's own settings screen. Which
+*lights* are in the group is different - that's collected by the
+interactive setup flow (see `setup_flow.py`), not a regular setting, so
+editing it goes through **Reconfigure** instead: find the HA Lights Sync
+provider in Music Assistant's provider list and look for a "Reconfigure"
+action (exactly the same picker form as initial setup, prefilled with your
+current selection - add or remove lights and save). This is a generic
+Music Assistant feature for any provider with a setup flow, not something
+built specifically for this plugin.
+
 ## Known limitations
 
 **The "HA Lights: &lt;name&gt;" player may be hidden by default.** If you

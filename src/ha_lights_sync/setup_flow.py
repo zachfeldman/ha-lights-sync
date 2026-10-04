@@ -17,6 +17,12 @@ render before the user saw "Setup failed."
 
 Runs for both initial setup and reconfigure (session.context.kind) - same
 form either way, prefilled from the existing selection on reconfigure.
+Reconfigure is a generic Music Assistant feature for any provider with a
+setup_flow.py (`config/providers/reconfigure` in
+music_assistant/controllers/config/flows.py) - no separate "edit my
+lights" mechanism needed; this file already handles both paths once the
+prefill reads from the right place (see the note below - got this wrong
+once already).
 """
 
 from __future__ import annotations
@@ -37,7 +43,16 @@ if TYPE_CHECKING:
 
 async def run_setup(session: SetupSession) -> None:
     """Run the HA Lights Sync setup/reconfigure flow."""
-    prefill = session.context.values.get(CONF_LIGHT_ENTITIES)
+    # session.context.setup_data, NOT .values: light_entities is collected by
+    # THIS flow (session.finish() persists it to the provider's setup_data -
+    # see provider.py's get_light_entity_ids() docstring for the same
+    # distinction, found there first). .values holds regular get_config_
+    # entries()-sourced settings (color_mode, brightness, ...), which this
+    # flow doesn't touch and which would always be empty here regardless.
+    # Confirmed against the real reconfigure path in music_assistant/
+    # controllers/config/flows.py's reconfigure_provider(), which populates
+    # context.setup_data from the provider's stored setup_data verbatim.
+    prefill = session.context.setup_data.get(CONF_LIGHT_ENTITIES)
     errors: dict[str, str] | None = None
     while True:
         values = await session.form(
