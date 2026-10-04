@@ -13,6 +13,9 @@ CONF_BEAT_MULTIPLIER: Final[str] = "beat_multiplier"
 CONF_TRANSITION_STYLE: Final[str] = "transition_style"
 CONF_HA_LATENCY_MS: Final[str] = "ha_latency_ms"
 CONF_SENSITIVITY: Final[str] = "sensitivity"
+CONF_HUE_LOCK_ENABLED: Final[str] = "hue_lock_enabled"
+CONF_HUE_LOCK_DEG: Final[str] = "hue_lock_deg"
+CONF_RESTORE_ON_STOP: Final[str] = "restore_on_stop"
 
 # -- Visualization styles --
 #
@@ -20,9 +23,62 @@ CONF_SENSITIVITY: Final[str] = "sensitivity"
 # concepts carry over for anyone who has used that one. First entry is the
 # default. "pulse" is the odd one out - its whole point is brightness
 # continuously tracking overall loudness and nothing else (no beat flash,
-# no hue jump) - see analyzer.py's _ModePreset.use_overall_level.
-COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energetic", "pulse")
+# no hue jump) - see analyzer.py's _ModePreset.use_overall_level. "auto"
+# doesn't have its own _ModePreset at all - render() dynamically substitutes
+# one of smooth/ambient/energetic/flashing based on the track's detected
+# energy, see analyzer.py's _select_auto_preset. "strobe" is a hard on/off
+# toggle (real light.turn_off between flashes, not just dimming) - see
+# _ModePreset.hard_strobe and the photosensitivity warning on its ConfigEntry
+# in provider.py. Deliberately excluded from "auto"'s candidate pool so
+# auto-selection can never surprise someone with a strobe effect.
+COLOR_MODES: Final[tuple[str, ...]] = (
+    "smooth", "ambient", "flashing", "energetic", "pulse", "auto", "strobe",
+)
 DEFAULT_COLOR_MODE: Final[str] = COLOR_MODES[0]
+
+# -- Auto mode --
+#
+# Candidate presets "auto" picks between, ordered low to high energy, paired
+# with the *overall loudness* EMA level (0-1) above which that candidate
+# becomes the pick. Hysteresis (AUTO_MIN_DWELL_S) rather than per-tick
+# re-evaluation, so a track hovering right at a boundary doesn't flap
+# between two presets every few seconds - once auto switches, it commits to
+# the new pick for at least this long before it's allowed to switch again,
+# even if the level crosses back over the boundary sooner.
+AUTO_MODE_CANDIDATES: Final[tuple[tuple[str, float], ...]] = (
+    ("ambient", 0.0),
+    ("smooth", 0.30),
+    ("energetic", 0.60),
+    ("flashing", 0.85),
+)
+AUTO_MIN_DWELL_S: Final[float] = 4.0
+
+# -- Hue lock --
+#
+# Overrides every mode's hue output (drift, beat jump, treble shift - all of
+# it) with one fixed degree value, while brightness/saturation keep reacting
+# normally. For someone who wants the lights to react to the music but stay
+# a specific color (a team color, a holiday color, matching a room's decor)
+# rather than roam the color wheel - a complaint dynamic hue has no other
+# way to address short of picking "ambient" and hoping the drift is slow
+# enough not to matter.
+DEFAULT_HUE_LOCK_ENABLED: Final[bool] = False
+DEFAULT_HUE_LOCK_DEG: Final[int] = 0
+HUE_LOCK_RANGE: Final[tuple[int, int]] = (0, 359)
+
+# -- Restore on stop --
+#
+# Whether to put each light back exactly how it was before the stream
+# started (on/off, brightness, color) once the stream really ends, instead
+# of leaving it frozen at whatever the last rendered frame happened to be.
+# Default true: freezing mid-color/mid-brightness when music stops reads as
+# broken even though it isn't. The one-time per-entity state snapshot this
+# needs is captured in bridge.py's _on_stream_start, not here.
+DEFAULT_RESTORE_ON_STOP: Final[bool] = True
+# Transition (seconds) used for the restore call itself - deliberately
+# gentle regardless of the configured transition_style, since "snap back to
+# whatever it was before" reads as glitchy if done as a hard instant cut.
+RESTORE_TRANSITION_S: Final[float] = 1.0
 
 DEFAULT_BRIGHTNESS: Final[int] = 100
 

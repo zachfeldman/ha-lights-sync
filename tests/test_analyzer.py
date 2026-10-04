@@ -74,7 +74,7 @@ def test_unknown_color_mode_falls_back_to_default() -> None:
     assert analyzer.color_mode == "smooth"
 
 
-@pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic", "pulse"])
+@pytest.mark.parametrize("mode", ["smooth", "ambient", "flashing", "energetic", "pulse", "auto", "strobe"])
 def test_every_preset_renders_without_error(mode: str) -> None:
     analyzer = HALightsAudioAnalyzer(color_mode=mode, brightness=100)
     analyzer.apply_spectrum([0.3] * 12)
@@ -315,3 +315,132 @@ def test_pulse_mode_brightness_rises_and_falls_with_overall_level() -> None:
         analyzer.apply_spectrum([1.0] * 12)
     loud_brightness = analyzer.render(now_s=2.0).brightness
     assert loud_brightness > quiet_brightness
+
+
+# -- Auto mode --
+
+
+def test_auto_mode_picks_a_low_energy_preset_for_quiet_audio() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="auto", brightness=100)
+    for _ in range(15):
+        analyzer.apply_spectrum([0.0] * 12)
+    analyzer.render(now_s=1.0)
+    assert analyzer._auto_mode == "ambient"  # noqa: SLF001
+
+
+def test_auto_mode_picks_a_high_energy_preset_for_loud_audio() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="auto", brightness=100)
+    for _ in range(15):
+        analyzer.apply_spectrum([1.0] * 12)
+    # First classification ever - takes effect immediately, no dwell wait.
+    analyzer.render(now_s=1.0)
+    assert analyzer._auto_mode == "flashing"  # noqa: SLF001
+
+
+def test_auto_mode_does_not_flap_before_the_min_dwell_time() -> None:
+    from ha_lights_sync.const import AUTO_MIN_DWELL_S
+
+    analyzer = HALightsAudioAnalyzer(color_mode="auto", brightness=100)
+    for _ in range(15):
+        analyzer.apply_spectrum([0.0] * 12)
+    analyzer.render(now_s=0.0)
+    assert analyzer._auto_mode == "ambient"  # noqa: SLF001
+
+    # Loud now, but well before the dwell window closes - must not switch yet.
+    for _ in range(15):
+        analyzer.apply_spectrum([1.0] * 12)
+    analyzer.render(now_s=AUTO_MIN_DWELL_S / 2)
+    assert analyzer._auto_mode == "ambient"  # noqa: SLF001
+
+    # Still loud, now past the dwell window - free to switch.
+    analyzer.render(now_s=AUTO_MIN_DWELL_S + 1.0)
+    assert analyzer._auto_mode == "flashing"  # noqa: SLF001
+
+
+def test_auto_mode_never_selects_strobe() -> None:
+    from ha_lights_sync.const import AUTO_MODE_CANDIDATES
+
+    assert "strobe" not in {name for name, _ in AUTO_MODE_CANDIDATES}
+
+
+# -- Strobe mode --
+
+
+def test_strobe_is_off_between_beats() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="strobe", brightness=100)
+    analyzer.apply_spectrum([1.0] * 12)  # loud, continuous - must not matter for strobe
+    command = analyzer.render(now_s=5.0)  # no beat scheduled near this timestamp
+    assert command.on is False
+
+
+def test_strobe_is_on_right_after_a_beat() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="strobe", brightness=100)
+    analyzer.push_beats([(1.0, False)])
+    command = analyzer.render(now_s=1.0)
+    assert command.on is True
+    assert command.brightness == 100
+
+
+def test_strobe_turns_back_off_after_the_flash_decays() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="strobe", brightness=100)
+    analyzer.push_beats([(1.0, False)])
+    analyzer.render(now_s=1.0)
+    # Well past the (short) flash decay window, no new beat scheduled.
+    command = analyzer.render(now_s=10.0)
+    assert command.on is False
+
+
+def test_strobe_ignores_transition_style() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="strobe", transition_style="fade")
+    analyzer.push_beats([(1.0, False)])
+    command = analyzer.render(now_s=1.0)
+    assert command.transition_ms == 0
+
+
+def test_other_modes_are_always_on() -> None:
+    for mode in ("smooth", "ambient", "flashing", "energetic", "pulse", "auto"):
+        analyzer = HALightsAudioAnalyzer(color_mode=mode)
+        assert analyzer.render(now_s=0.0).on is True
+
+
+# -- Hue lock --
+
+
+def test_hue_lock_overrides_beat_driven_hue_jump() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="smooth", hue_lock_enabled=True, hue_lock_deg=200)
+    analyzer.push_beats([(1.0, True)])  # downbeat - largest possible hue jump
+    command = analyzer.render(now_s=1.0)
+    assert command.hue == 200
+
+
+def test_hue_lock_overrides_treble_driven_hue_shift() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="smooth", hue_lock_enabled=True, hue_lock_deg=90)
+    for _ in range(15):
+        analyzer.apply_spectrum([1.0] * 12)  # loud treble, would normally shift hue
+    command = analyzer.render(now_s=1.0)
+    assert command.hue == 90
+
+
+def test_hue_lock_disabled_lets_hue_vary() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="smooth", hue_lock_enabled=False)
+    analyzer.push_beats([(1.0, True)])
+    command = analyzer.render(now_s=1.0)
+    assert command.hue != 0  # the downbeat jump should have moved it off its 0.0 start
+
+
+def test_update_settings_can_enable_and_disable_hue_lock() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="smooth")
+    analyzer.update_settings(hue_lock_enabled=True, hue_lock_deg=42)
+    assert analyzer.render(now_s=0.0).hue == 42
+
+    analyzer.update_settings(hue_lock_enabled=False)
+    analyzer.push_beats([(1.0, True)])
+    command = analyzer.render(now_s=1.0)
+    assert command.hue != 42
+
+
+def test_hue_lock_works_with_strobe_mode_too() -> None:
+    analyzer = HALightsAudioAnalyzer(color_mode="strobe", hue_lock_enabled=True, hue_lock_deg=15)
+    analyzer.push_beats([(1.0, False)])
+    command = analyzer.render(now_s=1.0)
+    assert command.hue == 15

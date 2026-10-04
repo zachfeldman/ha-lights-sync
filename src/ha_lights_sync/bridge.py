@@ -52,15 +52,23 @@ from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROL
 from .analyzer import HALightsAudioAnalyzer
 from .const import (
     CALL_SERVICE_TIMEOUT_S,
+    DEFAULT_RESTORE_ON_STOP,
     ENTITY_LATENCY_EMA_ALPHA,
     ENTITY_LATENCY_SAFETY_FACTOR,
     RENDER_PERIOD_S,
+    RESTORE_TRANSITION_S,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
     SPECTRUM_F_MIN,
     SPECTRUM_SCALE,
     VISUALIZER_RATE_HZ,
 )
+
+# Color attributes a light state can carry, in the order we'll prefer them
+# when restoring (light.turn_on accepts only one color spec at a time - see
+# _build_restore_service_data). hs_color first since it's what we send
+# ourselves during sync, so it's the most common case to restore exactly.
+_RESTORE_COLOR_ATTRS: tuple[str, ...] = ("hs_color", "rgb_color", "xy_color", "color_temp_kelvin")
 
 if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
@@ -115,6 +123,18 @@ class HALightGroupBridge:
         self._is_streaming = False
         self._stop_debounce_task: asyncio.Task[None] | None = None
         self._render_handle: asyncio.TimerHandle | None = None
+        # Whether to put each light back how it was before the stream
+        # started once it really ends - see _capture_pre_sync_state/
+        # _restore_pre_sync_state. Set from the provider's own setting in
+        # start(); the literal default here never actually applies (always
+        # overwritten before the bridge does anything), just avoids an
+        # Optional type for a brief window.
+        self.restore_on_stop: bool = DEFAULT_RESTORE_ON_STOP
+        # entity_id -> {"state": "on"/"off", "attributes": {...}}, captured
+        # fresh on every stream start, consumed (and cleared) by the next
+        # restore. Empty whenever there's nothing to restore - either
+        # restore_on_stop is off, capture failed, or a restore already ran.
+        self._pre_sync_state: dict[str, dict] = {}
 
     async def start(self) -> None:
         """Grab the Home Assistant connection and register as a Sendspin visualizer client."""
@@ -132,7 +152,10 @@ class HALightGroupBridge:
             beat_multiplier=self.provider.get_beat_multiplier(),
             transition_style=self.provider.get_transition_style(),
             sensitivity=self.provider.get_sensitivity(),
+            hue_lock_enabled=self.provider.get_hue_lock_enabled(),
+            hue_lock_deg=self.provider.get_hue_lock_deg(),
         )
+        self.restore_on_stop = self.provider.get_restore_on_stop()
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
 
@@ -200,6 +223,12 @@ class HALightGroupBridge:
             task.cancel()
         self._pending_send.clear()
 
+        # Best-effort: if the provider is being unloaded/reloaded mid-play,
+        # the stream-end path (_debounced_stop) never gets a chance to run -
+        # restore here instead, before _hass goes away, so a config change
+        # (e.g. editing the light list) doesn't leave lights stuck mid-sync.
+        await self._restore_pre_sync_state()
+
         self._hass = None
         self._is_streaming = False
         self.logger.debug("HA Lights bridge stopped for '%s'", self.group_name)
@@ -211,6 +240,9 @@ class HALightGroupBridge:
         beat_multiplier: int | None = None,
         transition_style: str | None = None,
         sensitivity: int | None = None,
+        hue_lock_enabled: bool | None = None,
+        hue_lock_deg: int | None = None,
+        restore_on_stop: bool | None = None,
     ) -> None:
         """Update analyzer settings without restarting the bridge."""
         if self._analyzer:
@@ -220,7 +252,13 @@ class HALightGroupBridge:
                 beat_multiplier=beat_multiplier,
                 transition_style=transition_style,
                 sensitivity=sensitivity,
+                hue_lock_enabled=hue_lock_enabled,
+                hue_lock_deg=hue_lock_deg,
             )
+        # Not an analyzer concern - this is purely a bridge-level behavior
+        # (what to do at stream-end), not anything rendered per-tick.
+        if restore_on_stop is not None:
+            self.restore_on_stop = restore_on_stop
 
     # -- Sendspin callbacks --
 
@@ -234,7 +272,15 @@ class HALightGroupBridge:
         if not self._is_streaming:
             self._is_streaming = True
             self.logger.info("Stream starting for '%s'", self.group_name)
-            self._start_render_loop()
+            # Capture pre-sync state and only THEN start the render loop
+            # (rather than starting it immediately and capturing in
+            # parallel) so there's no race where a render tick fires and
+            # overwrites a light's state before the snapshot is taken.
+            self.mass.create_task(self._begin_streaming())
+
+    async def _begin_streaming(self) -> None:
+        await self._capture_pre_sync_state()
+        self._start_render_loop()
 
     def _on_stream_end(self) -> None:
         if self._is_streaming:
@@ -252,6 +298,7 @@ class HALightGroupBridge:
             self.logger.info("Visualizer stream ended for '%s'", self.group_name)
             self._is_streaming = False
             self._cancel_render_loop()
+            await self._restore_pre_sync_state()
 
     def _on_visualizer_frame(self, frame: ExtractedFrame) -> None:
         if self._analyzer is None or not self._is_streaming:
@@ -266,6 +313,70 @@ class HALightGroupBridge:
     def _on_beats_clear(self) -> None:
         if self._analyzer is not None:
             self._analyzer.clear_beats()
+
+    # -- Pre-sync state capture/restore --
+
+    async def _capture_pre_sync_state(self) -> None:
+        """
+        Snapshot each configured light's current state before the first render overwrites it.
+
+        Best-effort: if this fails (hass not connected, a transient
+        get_states() error) we simply have nothing to restore later rather
+        than blocking the stream from starting - a missed restore is far
+        less disruptive than music never starting to sync.
+        """
+        self._pre_sync_state = {}
+        if self._hass is None or not self.restore_on_stop:
+            return
+        try:
+            states = await self._hass.get_states()
+        except Exception:
+            self.logger.debug(
+                "Failed to capture pre-sync light state for '%s' (restore will be skipped)",
+                self.group_name,
+                exc_info=True,
+            )
+            return
+        by_entity = {s["entity_id"]: s for s in states}
+        for entity_id in self.entity_ids:
+            state = by_entity.get(entity_id)
+            if state is not None:
+                self._pre_sync_state[entity_id] = {
+                    "state": state.get("state"),
+                    "attributes": dict(state.get("attributes") or {}),
+                }
+
+    async def _restore_pre_sync_state(self) -> None:
+        """Put each light back how it was captured in _capture_pre_sync_state, if enabled."""
+        if not self.restore_on_stop or self._hass is None or not self._pre_sync_state:
+            return
+        snapshot, self._pre_sync_state = self._pre_sync_state, {}
+        for entity_id, captured in snapshot.items():
+            try:
+                if captured["state"] == "off":
+                    await self._hass.call_service(
+                        "light",
+                        "turn_off",
+                        service_data={"transition": RESTORE_TRANSITION_S},
+                        target={"entity_id": entity_id},
+                    )
+                else:
+                    await self._hass.call_service(
+                        "light",
+                        "turn_on",
+                        service_data=_build_restore_service_data(captured["attributes"]),
+                        target={"entity_id": entity_id},
+                    )
+            except Exception:
+                self.logger.debug(
+                    "Failed to restore pre-sync state for %s", entity_id, exc_info=True
+                )
+        self.logger.info(
+            "Restored %d light%s to their pre-sync state for '%s'",
+            len(snapshot),
+            "" if len(snapshot) == 1 else "s",
+            self.group_name,
+        )
 
     # -- Render loop --
 
@@ -380,20 +491,32 @@ class HALightGroupBridge:
         # what actually guards against this never returning at all.
         start = time.monotonic()
         try:
-            await self._hass.call_service(
-                "light",
-                "turn_on",
-                service_data={
-                    "hs_color": [command.hue, command.saturation],
-                    "brightness_pct": command.brightness,
-                    # light.turn_on's transition is in seconds, unlike the
-                    # millisecond unit used everywhere else in this plugin
-                    # (matching python-kasa's/Hue's convention) - convert here,
-                    # at the one spot that actually calls the HA service.
-                    "transition": command.transition_ms / 1000.0,
-                },
-                target={"entity_id": entity_id},
-            )
+            if command.on:
+                await self._hass.call_service(
+                    "light",
+                    "turn_on",
+                    service_data={
+                        "hs_color": [command.hue, command.saturation],
+                        "brightness_pct": command.brightness,
+                        # light.turn_on's transition is in seconds, unlike the
+                        # millisecond unit used everywhere else in this plugin
+                        # (matching python-kasa's/Hue's convention) - convert
+                        # here, at the one spot that actually calls the HA
+                        # service.
+                        "transition": command.transition_ms / 1000.0,
+                    },
+                    target={"entity_id": entity_id},
+                )
+            else:
+                # "strobe" mode's off phase - a real turn_off, not a dim
+                # floor (see analyzer.py's _ModePreset.hard_strobe). Same
+                # transition handling as turn_on, for consistency.
+                await self._hass.call_service(
+                    "light",
+                    "turn_off",
+                    service_data={"transition": command.transition_ms / 1000.0},
+                    target={"entity_id": entity_id},
+                )
             elapsed_ms = round((time.monotonic() - start) * 1000)
             self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
             # Only successful, non-stuck calls feed the pacing estimate - a
@@ -417,3 +540,25 @@ class HALightGroupBridge:
             self.logger.debug(
                 "light.turn_on failed for %s (will retry next tick)", entity_id, exc_info=True
             )
+
+
+def _build_restore_service_data(attributes: dict) -> dict:
+    """
+    Build light.turn_on service_data that puts a light back to a captured state.
+
+    light.turn_on accepts only one color specification at a time, so this
+    picks the first one present in _RESTORE_COLOR_ATTRS (hs_color is tried
+    first since it's what we send ourselves during sync - the common case
+    is restoring exactly that). brightness is passed through as the
+    absolute 0-255 HA uses in state attributes, not the 0-100 percent this
+    plugin's own commands use elsewhere - straight passthrough of whatever
+    was captured, not a re-derived value.
+    """
+    service_data: dict = {"transition": RESTORE_TRANSITION_S}
+    if attributes.get("brightness") is not None:
+        service_data["brightness"] = attributes["brightness"]
+    for key in _RESTORE_COLOR_ATTRS:
+        if attributes.get(key) is not None:
+            service_data[key] = attributes[key]
+            break
+    return service_data

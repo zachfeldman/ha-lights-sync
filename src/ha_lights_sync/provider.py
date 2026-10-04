@@ -35,15 +35,22 @@ from .const import (
     CONF_BEAT_MULTIPLIER,
     CONF_BRIGHTNESS,
     CONF_COLOR_MODE,
+    CONF_HUE_LOCK_DEG,
+    CONF_HUE_LOCK_ENABLED,
     CONF_LIGHT_ENTITIES,
+    CONF_RESTORE_ON_STOP,
     CONF_SENSITIVITY,
     CONF_TRANSITION_STYLE,
     COLOR_MODES,
     DEFAULT_BEAT_MULTIPLIER,
     DEFAULT_BRIGHTNESS,
     DEFAULT_COLOR_MODE,
+    DEFAULT_HUE_LOCK_DEG,
+    DEFAULT_HUE_LOCK_ENABLED,
+    DEFAULT_RESTORE_ON_STOP,
     DEFAULT_SENSITIVITY,
     DEFAULT_TRANSITION_STYLE,
+    HUE_LOCK_RANGE,
     SENSITIVITY_RANGE,
     TRANSITION_STYLES,
 )
@@ -56,6 +63,15 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
 
 LOGGER = logging.getLogger(__name__)
+
+# Most color_mode options just need their name capitalized for a label (see
+# get_config_entries below); "strobe" gets an explicit override so the
+# photosensitivity risk is visible right in the dropdown, not just in the
+# README - someone scanning option names shouldn't be able to pick it
+# without seeing the warning.
+_COLOR_MODE_TITLES: dict[str, str] = {
+    "strobe": "Strobe (hard flashing - photosensitivity risk)",
+}
 
 
 class HALightsSyncProvider(PluginProvider):
@@ -85,8 +101,17 @@ class HALightsSyncProvider(PluginProvider):
             ConfigEntry(
                 key=CONF_COLOR_MODE,
                 type=ConfigEntryType.STRING,
+                description=(
+                    "'Auto' picks between Smooth/Ambient/Energetic/Flashing on its own "
+                    "based on how energetic the music currently sounds, instead of staying "
+                    "on one fixed mode for the whole track. 'Strobe' is a hard on/off "
+                    "toggle, not a dim/brighten - see its own warning below."
+                ),
                 default_value=DEFAULT_COLOR_MODE,
-                options=[ConfigValueOption(mode, title=mode.capitalize()) for mode in COLOR_MODES],
+                options=[
+                    ConfigValueOption(mode, title=_COLOR_MODE_TITLES.get(mode, mode.capitalize()))
+                    for mode in COLOR_MODES
+                ],
                 category="settings",
             ),
             ConfigEntry(
@@ -141,6 +166,43 @@ class HALightsSyncProvider(PluginProvider):
                 range=SENSITIVITY_RANGE,
                 category="settings",
             ),
+            ConfigEntry(
+                key=CONF_HUE_LOCK_ENABLED,
+                type=ConfigEntryType.BOOLEAN,
+                label="Lock color",
+                description=(
+                    "Keep the lights on one fixed color (set via 'Locked color' below) "
+                    "regardless of beat/treble-driven color changes - only brightness and "
+                    "saturation keep reacting to the music. For matching a room's decor or "
+                    "a specific color rather than roaming the color wheel."
+                ),
+                default_value=DEFAULT_HUE_LOCK_ENABLED,
+                category="settings",
+            ),
+            ConfigEntry(
+                key=CONF_HUE_LOCK_DEG,
+                type=ConfigEntryType.INTEGER,
+                label="Locked color (hue degrees)",
+                description=(
+                    "Only used when 'Lock color' above is on. 0=red, 60=yellow, "
+                    "120=green, 180=cyan, 240=blue, 300=magenta."
+                ),
+                default_value=DEFAULT_HUE_LOCK_DEG,
+                range=HUE_LOCK_RANGE,
+                category="settings",
+            ),
+            ConfigEntry(
+                key=CONF_RESTORE_ON_STOP,
+                type=ConfigEntryType.BOOLEAN,
+                label="Restore lights when music stops",
+                description=(
+                    "When the music stops, put each light back exactly how it was just "
+                    "before syncing started (on/off, brightness, color) instead of leaving "
+                    "it frozen at whatever the last beat happened to render."
+                ),
+                default_value=DEFAULT_RESTORE_ON_STOP,
+                category="settings",
+            ),
         )
 
     def get_color_mode(self) -> str:
@@ -173,6 +235,22 @@ class HALightsSyncProvider(PluginProvider):
             return max(lo, min(hi, int(value)))
         except (TypeError, ValueError):
             return DEFAULT_SENSITIVITY
+
+    def get_hue_lock_enabled(self) -> bool:
+        value = self.config.get_value(CONF_HUE_LOCK_ENABLED)
+        return bool(value) if value is not None else DEFAULT_HUE_LOCK_ENABLED
+
+    def get_hue_lock_deg(self) -> int:
+        value = self.config.get_value(CONF_HUE_LOCK_DEG)
+        try:
+            lo, hi = HUE_LOCK_RANGE
+            return max(lo, min(hi, int(value)))
+        except (TypeError, ValueError):
+            return DEFAULT_HUE_LOCK_DEG
+
+    def get_restore_on_stop(self) -> bool:
+        value = self.config.get_value(CONF_RESTORE_ON_STOP)
+        return bool(value) if value is not None else DEFAULT_RESTORE_ON_STOP
 
     def get_light_entity_ids(self) -> list[str]:
         """
@@ -241,6 +319,9 @@ class HALightsSyncProvider(PluginProvider):
                 CONF_BEAT_MULTIPLIER,
                 CONF_TRANSITION_STYLE,
                 CONF_SENSITIVITY,
+                CONF_HUE_LOCK_ENABLED,
+                CONF_HUE_LOCK_DEG,
+                CONF_RESTORE_ON_STOP,
             )
         }
         # Logged at INFO (not just debug) while this is still new: confirms,
@@ -260,6 +341,9 @@ class HALightsSyncProvider(PluginProvider):
                 beat_multiplier=self.get_beat_multiplier(),
                 transition_style=self.get_transition_style(),
                 sensitivity=self.get_sensitivity(),
+                hue_lock_enabled=self.get_hue_lock_enabled(),
+                hue_lock_deg=self.get_hue_lock_deg(),
+                restore_on_stop=self.get_restore_on_stop(),
             )
             self.config = config
             return

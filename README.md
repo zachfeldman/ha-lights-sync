@@ -281,14 +281,47 @@ to you:
 | Setting | Description |
 |---|---|
 | `light_entities` | The Home Assistant `light.*` entities this group drives. Multi-select, populated live from Home Assistant - any light already set up there is selectable. |
-| `color_mode` | `smooth` (gentle, beat-tinted color drift), `ambient` (slower, bass-reactive saturation), `flashing` (strong pulse every beat), `energetic` (big brightness swings, fast color rotation), `pulse` (brightness continuously tracks the music's overall loudness, no beat flash - see below). |
+| `color_mode` | `smooth`, `ambient`, `flashing`, `energetic`, `pulse` (brightness tracks overall loudness, no beat flash), `auto` (picks between the first four on its own based on the track's energy), `strobe` (hard on/off toggle - see its warning below). |
 | `brightness` | 1–100, the ceiling this group renders up to. |
 | `beat_multiplier` ("Speed") | `1x`, `2x`, or `4x` pulses per beat (see below). |
-| `transition_style` ("Transition style") | `fade` (default, eases between colors/brightness) or `instant` (hard, un-eased cut on every update - see below). |
+| `transition_style` ("Transition style") | `fade` (default, eases between colors/brightness) or `instant` (hard, un-eased cut on every update - see below). Ignored entirely by `strobe`, which always hard-cuts. |
 | `sensitivity` ("Sensitivity") | 25–400%, default 100%. Gain on the detected audio signal itself - see below. Distinct from Speed, which only changes pulse *frequency*, not signal *strength*. |
+| `hue_lock_enabled` / `hue_lock_deg` ("Lock color" / "Locked color") | When enabled, overrides every mode's hue output (drift, beat jump, treble shift) with one fixed degree value - only brightness/saturation keep reacting. For staying on a specific color instead of roaming the color wheel. |
+| `restore_on_stop` ("Restore lights when music stops") | Default on. Puts each light back exactly how it was before the stream started (on/off, brightness, color) once the music really stops, instead of leaving it frozen mid-render. |
 
-All six settings apply to the running bridge immediately on save - no
+All settings apply to the running bridge immediately on save - no
 restart, no re-grouping needed.
+
+### Auto mode
+
+`auto` doesn't have tuning of its own - it dynamically picks between
+`ambient`/`smooth`/`energetic`/`flashing` based on the track's current
+overall-loudness level (`AUTO_MODE_CANDIDATES` in `const.py`: quieter
+passages render as `ambient`, louder ones climb towards `flashing`), so one
+mode setting can follow a track (or a whole playlist) through quiet verses
+and loud choruses instead of staying fixed on whichever mode suited the
+song you had in mind when you set it. Switches are debounced
+(`AUTO_MIN_DWELL_S`, 4 seconds) so a level hovering right at a boundary
+doesn't flap between two presets every few seconds. `strobe` is
+deliberately never a candidate here - auto-selection should never surprise
+anyone with a hard-flashing effect.
+
+### Strobe mode - ⚠️ photosensitivity warning
+
+`strobe` is not a brighter version of `flashing` - it's a genuinely
+different mechanism. Every other mode (including `flashing`) always sends
+`light.turn_on`, just with brightness dipping low between beats; `strobe`
+sends a real `light.turn_off` between beats and snaps to full brightness
+for each beat's flash-decay window, a true hard on/off toggle
+(`_ModePreset.hard_strobe` in `analyzer.py`, `LightCommand.on` in the
+bridge). Combined with a high `beat_multiplier` on a fast track, this can
+produce a rapid, high-contrast strobing effect.
+
+**If you or anyone who'll see these lights has photosensitive epilepsy or
+another seizure disorder, do not use this mode.** This is a real risk, not
+boilerplate - rapid high-contrast flashing is a documented seizure trigger
+for photosensitive individuals. The Settings dropdown labels this option
+with the same warning so it's visible before you pick it, not just here.
 
 ### Pulse mode
 
@@ -318,6 +351,30 @@ on beat timing at all: beat timestamps come from Sendspin's own tempo
 tracking, a separate signal from the spectrum magnitude this setting scales
 (see `push_beats`) - that's what makes it a genuinely different knob from
 Speed (`beat_multiplier`), which only changes how often pulses fire.
+
+### Lock color
+
+Every mode's hue normally drifts continuously and jumps on beats/downbeats
+(plus a small shift from treble energy). `hue_lock_enabled` overrides all
+of that with one fixed `hue_lock_deg` value (0=red, 60=yellow, 120=green,
+180=cyan, 240=blue, 300=magenta) - brightness and saturation keep reacting
+to the music exactly as normal, only the color itself is pinned. This is
+the override of last resort, applied once, after everything else in
+`render()` has already computed its own idea of what the hue should be
+(including in `strobe` mode) - so it works identically regardless of which
+other mode is active.
+
+### Restore lights when music stops
+
+On by default. When the Sendspin stream genuinely ends (after the same
+debounce that already protects against flapping between tracks), each
+configured light is put back to exactly the on/off, brightness and color it
+had the instant before this plugin started controlling it, rather than
+being left frozen at whatever the last render happened to look like. The
+snapshot is taken right as a stream starts (before the first render can
+overwrite anything) and consumed once at stream-end; turning this off
+reverts to the old behavior of simply leaving the light wherever it last
+rendered.
 
 ### Speed (`beat_multiplier`)
 
