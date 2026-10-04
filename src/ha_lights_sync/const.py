@@ -80,6 +80,17 @@ DEFAULT_RESTORE_ON_STOP: Final[bool] = True
 # whatever it was before" reads as glitchy if done as a hard instant cut.
 RESTORE_TRANSITION_S: Final[float] = 1.0
 
+# -- Settings-change confirmation flash --
+#
+# A settings change (color_mode, brightness, Speed, ...) applies silently
+# and instantly - there's nothing to actually SEE happen if music isn't
+# playing at that moment, which makes "did my change actually take effect"
+# a real question with no visual answer. Flashing every configured light
+# white at full brightness right when a change is saved gives an
+# unmistakable, immediate confirmation independent of whether anything is
+# currently streaming - see bridge.py's update_settings/_flash_confirmation.
+SETTINGS_FLASH_S: Final[float] = 2.0
+
 DEFAULT_BRIGHTNESS: Final[int] = 100
 
 # -- Sensitivity --

@@ -57,6 +57,7 @@ from .const import (
     ENTITY_LATENCY_SAFETY_FACTOR,
     RENDER_PERIOD_S,
     RESTORE_TRANSITION_S,
+    SETTINGS_FLASH_S,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
     SPECTRUM_F_MIN,
@@ -135,6 +136,12 @@ class HALightGroupBridge:
         # restore. Empty whenever there's nothing to restore - either
         # restore_on_stop is off, capture failed, or a restore already ran.
         self._pre_sync_state: dict[str, dict] = {}
+        # Tracks the in-progress settings-change confirmation flash, if
+        # any - see update_settings/_flash_confirmation. Cancelled and
+        # replaced (not left to run alongside) if another settings change
+        # arrives before the current flash finishes, so dragging a slider
+        # doesn't stack up several overlapping flashes.
+        self._flash_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Grab the Home Assistant connection and register as a Sendspin visualizer client."""
@@ -215,6 +222,12 @@ class HALightGroupBridge:
                 await self._stop_debounce_task
         self._stop_debounce_task = None
 
+        if self._flash_task and not self._flash_task.done():
+            self._flash_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._flash_task
+        self._flash_task = None
+
         if self._sendspin_client:
             await self.sendspin_server.remove_client(self._sendspin_client.client_id)
             self._sendspin_client = None
@@ -259,6 +272,15 @@ class HALightGroupBridge:
         # (what to do at stream-end), not anything rendered per-tick.
         if restore_on_stop is not None:
             self.restore_on_stop = restore_on_stop
+        self._trigger_settings_flash()
+
+    def _trigger_settings_flash(self) -> None:
+        """Start (or restart) the settings-change confirmation flash - see _flash_confirmation."""
+        if self._hass is None or not self.entity_ids:
+            return
+        if self._flash_task and not self._flash_task.done():
+            self._flash_task.cancel()
+        self._flash_task = self.mass.create_task(self._flash_confirmation())
 
     # -- Sendspin callbacks --
 
@@ -314,43 +336,41 @@ class HALightGroupBridge:
         if self._analyzer is not None:
             self._analyzer.clear_beats()
 
-    # -- Pre-sync state capture/restore --
+    # -- Light state snapshot/restore (generic - used by both pre-sync and the settings flash) --
 
-    async def _capture_pre_sync_state(self) -> None:
+    async def _snapshot_entity_states(self) -> dict[str, dict]:
         """
-        Snapshot each configured light's current state before the first render overwrites it.
+        Capture each configured light's current state.
 
         Best-effort: if this fails (hass not connected, a transient
-        get_states() error) we simply have nothing to restore later rather
-        than blocking the stream from starting - a missed restore is far
-        less disruptive than music never starting to sync.
+        get_states() error) the caller just has nothing to restore later -
+        for pre-sync state that means skipping the stream-end restore; for
+        the settings flash it means the light stays however the flash left
+        it. Neither is worth blocking anything else on.
         """
-        self._pre_sync_state = {}
-        if self._hass is None or not self.restore_on_stop:
-            return
+        if self._hass is None:
+            return {}
         try:
             states = await self._hass.get_states()
         except Exception:
             self.logger.debug(
-                "Failed to capture pre-sync light state for '%s' (restore will be skipped)",
-                self.group_name,
-                exc_info=True,
+                "Failed to snapshot light state for '%s'", self.group_name, exc_info=True
             )
-            return
+            return {}
         by_entity = {s["entity_id"]: s for s in states}
-        for entity_id in self.entity_ids:
-            state = by_entity.get(entity_id)
-            if state is not None:
-                self._pre_sync_state[entity_id] = {
-                    "state": state.get("state"),
-                    "attributes": dict(state.get("attributes") or {}),
-                }
+        return {
+            entity_id: {
+                "state": by_entity[entity_id].get("state"),
+                "attributes": dict(by_entity[entity_id].get("attributes") or {}),
+            }
+            for entity_id in self.entity_ids
+            if entity_id in by_entity
+        }
 
-    async def _restore_pre_sync_state(self) -> None:
-        """Put each light back how it was captured in _capture_pre_sync_state, if enabled."""
-        if not self.restore_on_stop or self._hass is None or not self._pre_sync_state:
+    async def _restore_snapshot(self, snapshot: dict[str, dict]) -> None:
+        """Put each light in ``snapshot`` back to its captured state."""
+        if self._hass is None or not snapshot:
             return
-        snapshot, self._pre_sync_state = self._pre_sync_state, {}
         for entity_id, captured in snapshot.items():
             try:
                 if captured["state"] == "off":
@@ -369,14 +389,105 @@ class HALightGroupBridge:
                     )
             except Exception:
                 self.logger.debug(
-                    "Failed to restore pre-sync state for %s", entity_id, exc_info=True
+                    "Failed to restore light state for %s", entity_id, exc_info=True
                 )
+
+    # -- Pre-sync state capture/restore --
+
+    async def _capture_pre_sync_state(self) -> None:
+        """Snapshot each configured light's current state before the first render overwrites it."""
+        self._pre_sync_state = {}
+        if not self.restore_on_stop:
+            return
+        self._pre_sync_state = await self._snapshot_entity_states()
+
+    async def _restore_pre_sync_state(self) -> None:
+        """Put each light back how it was captured in _capture_pre_sync_state, if enabled."""
+        if not self.restore_on_stop or not self._pre_sync_state:
+            return
+        snapshot, self._pre_sync_state = self._pre_sync_state, {}
+        await self._restore_snapshot(snapshot)
         self.logger.info(
             "Restored %d light%s to their pre-sync state for '%s'",
             len(snapshot),
             "" if len(snapshot) == 1 else "s",
             self.group_name,
         )
+
+    # -- Settings-change confirmation flash --
+
+    async def _flash_confirmation(self) -> None:
+        """
+        Flash every configured light white at full brightness for a couple seconds.
+
+        Fired on every live-applied settings change (see update_settings)
+        so a change is visibly confirmed instead of only showing up in a
+        log line - useful whether or not anything is currently streaming.
+
+        If music is currently streaming, the render loop is paused for the
+        flash and simply resumed afterward - its next tick naturally
+        repaints the correct color/brightness, no snapshot needed. If
+        nothing is streaming, the pre-flash state is captured and restored
+        afterward instead, same mechanism as _capture_pre_sync_state/
+        _restore_pre_sync_state but independent of the restore_on_stop
+        setting - this flash always cleans up after itself regardless.
+
+        Uses ``self._is_streaming`` (not ``self._render_handle``) to decide
+        which path to take - the render loop's timer handle is itself
+        toggled by this method, so checking it directly would misread a
+        flash that's already paused the loop (e.g. a second settings
+        change arriving while an earlier flash is still sleeping) as "not
+        streaming" even though the stream is very much still active.
+        """
+        if self._hass is None or not self.entity_ids:
+            return
+        was_streaming = self._is_streaming
+        snapshot: dict[str, dict] = {}
+        if was_streaming:
+            self._cancel_render_loop()
+        else:
+            snapshot = await self._snapshot_entity_states()
+
+        self.logger.info(
+            "Flashing %d light%s white to confirm a settings change for '%s'",
+            len(self.entity_ids),
+            "" if len(self.entity_ids) == 1 else "s",
+            self.group_name,
+        )
+        for entity_id in self.entity_ids:
+            self.mass.create_task(self._send_flash_white(entity_id))
+
+        await asyncio.sleep(SETTINGS_FLASH_S)
+
+        if was_streaming:
+            if self._is_streaming:
+                self._start_render_loop()
+            else:
+                # The stream ended naturally while we were mid-flash -
+                # nothing to resume into. _debounced_stop's own restore may
+                # already have run (or may run right after this); fall
+                # back to it rather than leaving the light stuck white.
+                await self._restore_pre_sync_state()
+        else:
+            await self._restore_snapshot(snapshot)
+
+    async def _send_flash_white(self, entity_id: str) -> None:
+        """One-shot white/full-brightness command for the settings-change flash."""
+        if self._hass is None:
+            return
+        try:
+            await self._hass.call_service(
+                "light",
+                "turn_on",
+                # hs_color saturation=0 is white regardless of hue; transition=0
+                # for an unmistakable hard snap rather than a fade-in.
+                service_data={"hs_color": [0, 0], "brightness_pct": 100, "transition": 0},
+                target={"entity_id": entity_id},
+            )
+        except Exception:
+            self.logger.debug(
+                "Failed to send settings-change flash to %s", entity_id, exc_info=True
+            )
 
     # -- Render loop --
 

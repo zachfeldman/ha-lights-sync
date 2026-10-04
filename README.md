@@ -376,6 +376,26 @@ overwrite anything) and consumed once at stream-end; turning this off
 reverts to the old behavior of simply leaving the light wherever it last
 rendered.
 
+### Settings-change confirmation flash
+
+Every configured light flashes white at full brightness for ~2 seconds
+whenever a setting is saved (color_mode, brightness, Speed, Sensitivity,
+Lock color, Restore on stop - any of the live-applied settings), as an
+unmistakable visual "yes, that took effect" independent of whether music
+happens to be playing at that moment. Not itself a setting - always on,
+since the whole point is confirming settings changes, including whichever
+change might otherwise have disabled a way to see it.
+
+If music is currently playing, the sync is simply paused for those ~2
+seconds and resumes exactly where it left off - no need to remember
+anything, since the render loop's own next tick repaints the correct
+state. If nothing is playing, the light's state just before the flash is
+captured and restored afterward, the same mechanism `restore_on_stop` uses
+at stream-end, but independent of that setting - this flash always cleans
+up after itself. Changing several settings in quick succession (e.g.
+dragging a slider) restarts the 2-second window rather than queuing up
+multiple flashes back to back.
+
 ### Speed (`beat_multiplier`)
 
 The beat schedule Sendspin delivers is the track's real, tracked tempo - 1x
