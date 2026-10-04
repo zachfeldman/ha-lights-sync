@@ -10,5 +10,6 @@
   "documentation": "https://github.com/zachfeldman/ha-lights-sync",
   "multi_instance": true,
   "builtin": false,
+  "has_setup_flow": true,
   "icon": "led-strip-variant"
 }

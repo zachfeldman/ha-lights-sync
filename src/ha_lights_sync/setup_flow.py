@@ -23,6 +23,22 @@ music_assistant/controllers/config/flows.py) - no separate "edit my
 lights" mechanism needed; this file already handles both paths once the
 prefill reads from the right place (see the note below - got this wrong
 once already).
+
+The mere presence of this file is NOT enough for the Reconfigure *button*
+to show up in the UI when loaded via music-assistant-plugin-manager (it IS
+enough for reconfigure to actually work if triggered another way, and for
+initial setup - both independently re-check for this file rather than
+trusting a manifest flag). The button's visibility gates on the
+provider manifest's has_setup_flow field, which Music Assistant normally
+sets by checking for this exact file on disk under
+music_assistant/providers/<domain>/ - a path that doesn't exist for a
+plugin-manager-loaded provider (it lives wherever pip put it, reached via
+an import hook instead). See manifest.json's has_setup_flow: true, which
+works around this by declaring it directly - plugin-manager's patch
+builds the manifest from that file's raw contents rather than computing
+has_setup_flow itself. Confirmed via music-assistant/server's actual
+source, not guessed - see README's "Changing which lights are in the
+group later" section for the full trace.
 """
 
 from __future__ import annotations

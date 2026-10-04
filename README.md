@@ -213,12 +213,34 @@ your existing setup.
 settings, editable any time from the provider's own settings screen. Which
 *lights* are in the group is different - that's collected by the
 interactive setup flow (see `setup_flow.py`), not a regular setting, so
-editing it goes through **Reconfigure** instead: find the HA Lights Sync
-provider in Music Assistant's provider list and look for a "Reconfigure"
-action (exactly the same picker form as initial setup, prefilled with your
-current selection - add or remove lights and save). This is a generic
-Music Assistant feature for any provider with a setup flow, not something
-built specifically for this plugin.
+editing it goes through Music Assistant's generic **Reconfigure** action
+instead (exactly the same picker form as initial setup, prefilled with your
+current selection) - not something built specifically for this plugin.
+
+**If you don't see a "Reconfigure" button on the provider's settings page**,
+that's a real gap in `music-assistant-plugin-manager` (confirmed, not
+user error): Music Assistant's own provider loader auto-detects
+`has_setup_flow` by checking whether a `setup_flow.py` file physically
+exists under `music_assistant/providers/<domain>/` on disk. Plugin-manager-
+loaded providers don't live there - they're redirected via an import hook
+from wherever pip actually installed them - so that file-presence check
+never finds it, and `has_setup_flow` silently defaults to `False` even
+though the setup flow itself works perfectly (confirmed: it's invoked via
+its own independent import-and-catch-`ModuleNotFoundError` check in
+`music_assistant/controllers/config/flows.py`'s `_get_setup_flow_module`,
+which never consults the `has_setup_flow` flag at all). The frontend's
+Reconfigure button, however, *does* gate on that flag
+(`EditProvider`'s visibility condition checks
+`enabled && has_setup_flow && status !== INCOMPATIBLE`) - so the button
+silently never renders, for a reason that has nothing to do with whether
+reconfigure would actually work.
+
+This plugin works around it by declaring `"has_setup_flow": true` directly
+in its own `manifest.json`, since `music-assistant-plugin-manager`'s patch
+builds the `ProviderManifest` straight from that file's contents rather
+than computing it - any other plugin-manager-loaded provider that ships a
+`setup_flow.py` will need the same one-line fix to get a working
+Reconfigure button.
 
 ## Known limitations
 
