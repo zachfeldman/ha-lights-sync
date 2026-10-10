@@ -88,6 +88,12 @@ LOGGER = logging.getLogger(__name__)
 # brief gap doesn't flap the Sendspin client every song.
 _STOP_DEBOUNCE_S = 2.0
 
+# Max wall-clock time _begin_streaming will let the pre-sync snapshot delay
+# the render loop's start - see _begin_streaming's docstring for why this
+# is a race against a timeout rather than an await with one, same lesson
+# as _dispatch_send's stuck-call handling.
+_PRE_SYNC_SNAPSHOT_BUDGET_S = 0.5
+
 
 class HALightGroupBridge:
     """Manages one configured group of Home Assistant lights as a Sendspin visualizer client."""
@@ -294,14 +300,52 @@ class HALightGroupBridge:
         if not self._is_streaming:
             self._is_streaming = True
             self.logger.info("Stream starting for '%s'", self.group_name)
-            # Capture pre-sync state and only THEN start the render loop
-            # (rather than starting it immediately and capturing in
-            # parallel) so there's no race where a render tick fires and
-            # overwrites a light's state before the snapshot is taken.
             self.mass.create_task(self._begin_streaming())
 
     async def _begin_streaming(self) -> None:
-        await self._capture_pre_sync_state()
+        """
+        Capture pre-sync state (bounded by wall-clock time, not cancellation), then start rendering.
+
+        An earlier version of this method directly ``await``ed
+        ``_capture_pre_sync_state()`` before starting the render loop (to
+        avoid a render tick overwriting a light's state before the
+        snapshot was taken). That's correct in the common case, but it
+        means a single hung ``hass.get_states()`` call - the exact class
+        of wedged-coroutine failure ``_dispatch_send``'s docstring already
+        documents for ``call_service()`` - silently and permanently
+        blocked the render loop from ever starting, with nothing ever
+        logged about it. Confirmed happening in practice: a stream started
+        and (minutes later) ended cleanly in the logs with zero render
+        activity in between and the snapshot task still pending.
+
+        Wrapping the await in ``asyncio.wait_for`` would not reliably fix
+        this either: if the hung call never yields even to being
+        cancelled, ``wait_for``'s own await on the cancelled task can hang
+        right alongside it - no different from the plain await it's
+        replacing. Racing the snapshot against a short timeout via
+        ``asyncio.wait`` (which does **not** cancel the loser) sidesteps
+        that: the render loop starts on schedule regardless, a snapshot
+        that completes within the budget (the normal case - get_states()
+        has measured in the tens of ms in practice) is still used, and a
+        genuinely wedged call is simply abandoned - orphaned and harmless,
+        not blocking anything - rather than wedging the whole bridge.
+        """
+        snapshot_task = self.mass.create_task(self._capture_pre_sync_state())
+        await asyncio.wait({snapshot_task}, timeout=_PRE_SYNC_SNAPSHOT_BUDGET_S)
+        if not snapshot_task.done():
+            # Logged at WARNING (not just debug) on purpose - this is the
+            # one visible signal that get_states() is currently wedged,
+            # which otherwise produces no log output at all. Starting the
+            # render loop anyway regardless of this - that's the whole
+            # point of racing it instead of awaiting it directly.
+            self.logger.warning(
+                "Pre-sync state snapshot for '%s' didn't complete within %.1fs - "
+                "starting playback sync without it (restore-on-stop won't have "
+                "anything to restore to this time; the snapshot call may still "
+                "complete later in the background, harmlessly)",
+                self.group_name,
+                _PRE_SYNC_SNAPSHOT_BUDGET_S,
+            )
         self._start_render_loop()
 
     def _on_stream_end(self) -> None:
@@ -446,7 +490,12 @@ class HALightGroupBridge:
         if was_streaming:
             self._cancel_render_loop()
         else:
-            snapshot = await self._snapshot_entity_states()
+            # Same wall-clock race as _begin_streaming, same reason: a
+            # hung get_states() must not block the flash (or anything
+            # after it) forever - see that method's docstring.
+            snapshot_task = self.mass.create_task(self._snapshot_entity_states())
+            await asyncio.wait({snapshot_task}, timeout=_PRE_SYNC_SNAPSHOT_BUDGET_S)
+            snapshot = snapshot_task.result() if snapshot_task.done() else {}
 
         self.logger.info(
             "Flashing %d light%s white to confirm a settings change for '%s'",
