@@ -487,38 +487,71 @@ class HALightGroupBridge:
             return
         was_streaming = self._is_streaming
         snapshot: dict[str, dict] = {}
-        if was_streaming:
-            self._cancel_render_loop()
-        else:
-            # Same wall-clock race as _begin_streaming, same reason: a
-            # hung get_states() must not block the flash (or anything
-            # after it) forever - see that method's docstring.
-            snapshot_task = self.mass.create_task(self._snapshot_entity_states())
-            await asyncio.wait({snapshot_task}, timeout=_PRE_SYNC_SNAPSHOT_BUDGET_S)
-            snapshot = snapshot_task.result() if snapshot_task.done() else {}
-
-        self.logger.info(
-            "Flashing %d light%s white to confirm a settings change for '%s'",
-            len(self.entity_ids),
-            "" if len(self.entity_ids) == 1 else "s",
-            self.group_name,
-        )
-        for entity_id in self.entity_ids:
-            self.mass.create_task(self._send_flash_white(entity_id))
-
-        await asyncio.sleep(SETTINGS_FLASH_S)
-
-        if was_streaming:
-            if self._is_streaming:
-                self._start_render_loop()
+        # DEBUG_INSTRUMENTATION (Oct 2026 real-hardware test session): the
+        # "Flashing N lights white..." INFO log below was confirmed to NEVER
+        # print, in the entire available log history, despite this method
+        # being invoked on every single live settings change (color_mode
+        # switch, specifically) - i.e. this coroutine is dying (or never
+        # actually running) before reaching its own first log line, totally
+        # silently: no "Task exception was never retrieved", nothing. That
+        # also lines up with 2 of the 7 color_modes tested (energetic, auto)
+        # visually freezing on a single static color for most of their
+        # window during a real-hardware run - consistent with this method's
+        # own self._cancel_render_loop() call succeeding but the matching
+        # self._start_render_loop() below never being reached, leaving the
+        # render loop dead until the next settings change's flash (if any)
+        # happens to succeed. Root cause not yet confirmed - this try/except
+        # exists purely to stop swallowing whatever is actually happening.
+        # The try/finally also means a crash here no longer leaves the
+        # render loop permanently stuck: the restart logic that used to live
+        # only in the "success" path now always runs, cancelled or not.
+        try:
+            if was_streaming:
+                self._cancel_render_loop()
             else:
-                # The stream ended naturally while we were mid-flash -
-                # nothing to resume into. _debounced_stop's own restore may
-                # already have run (or may run right after this); fall
-                # back to it rather than leaving the light stuck white.
-                await self._restore_pre_sync_state()
-        else:
-            await self._restore_snapshot(snapshot)
+                # Same wall-clock race as _begin_streaming, same reason: a
+                # hung get_states() must not block the flash (or anything
+                # after it) forever - see that method's docstring.
+                snapshot_task = self.mass.create_task(self._snapshot_entity_states())
+                await asyncio.wait({snapshot_task}, timeout=_PRE_SYNC_SNAPSHOT_BUDGET_S)
+                snapshot = snapshot_task.result() if snapshot_task.done() else {}
+
+            self.logger.info(
+                "Flashing %d light%s white to confirm a settings change for '%s'",
+                len(self.entity_ids),
+                "" if len(self.entity_ids) == 1 else "s",
+                self.group_name,
+            )
+            for entity_id in self.entity_ids:
+                self.mass.create_task(self._send_flash_white(entity_id))
+
+            await asyncio.sleep(SETTINGS_FLASH_S)
+        except asyncio.CancelledError:
+            # Expected/normal: a newer settings change replaced this flash
+            # (see _trigger_settings_flash's cancel-and-replace). Not the bug
+            # under investigation - re-raise after the finally below still
+            # runs, so the render loop gets resumed either way.
+            raise
+        except Exception:
+            self.logger.exception(
+                "DEBUG_INSTRUMENTATION: _flash_confirmation crashed for '%s' - this is "
+                "exactly the silent failure under investigation (see bridge.py's "
+                "DEBUG_INSTRUMENTATION comment above). Render loop restart below still "
+                "runs regardless, so lights shouldn't freeze even though this flash failed.",
+                self.group_name,
+            )
+        finally:
+            if was_streaming:
+                if self._is_streaming:
+                    self._start_render_loop()
+                else:
+                    # The stream ended naturally while we were mid-flash -
+                    # nothing to resume into. _debounced_stop's own restore may
+                    # already have run (or may run right after this); fall
+                    # back to it rather than leaving the light stuck white.
+                    await self._restore_pre_sync_state()
+            else:
+                await self._restore_snapshot(snapshot)
 
     async def _send_flash_white(self, entity_id: str) -> None:
         """One-shot white/full-brightness command for the settings-change flash."""
