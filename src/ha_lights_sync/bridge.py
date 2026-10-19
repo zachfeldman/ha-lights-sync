@@ -45,13 +45,15 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSpectrum,
     ClientHelloVisualizerSupport,
 )
-from music_assistant_models.enums import PlayerType
+from music_assistant_models.enums import PlayerFeature, PlayerType
+from music_assistant_models.player import PlayerSoundMode
 
 from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROLE_ID, BridgeVisualizerRole
 
 from .analyzer import HALightsAudioAnalyzer
 from .const import (
     CALL_SERVICE_TIMEOUT_S,
+    COLOR_MODES,
     DEFAULT_RESTORE_ON_STOP,
     ENTITY_LATENCY_EMA_ALPHA,
     ENTITY_LATENCY_SAFETY_FACTOR,
@@ -83,6 +85,17 @@ if TYPE_CHECKING:
     from .provider import HALightsSyncProvider
 
 LOGGER = logging.getLogger(__name__)
+
+# How long _wire_sound_mode will wait for the Sendspin provider to actually
+# create this bridge's visualizer Player object before giving up. It doesn't
+# exist the instant register_external_player returns - the installed Music
+# Assistant server creates it from a fire-and-forget task kicked off by its
+# own client-added event handling, so there's a real (normally very short)
+# async gap. Giving up after this just means Sound Mode selection won't be
+# available from Home Assistant for this session - everything else about the
+# bridge is unaffected.
+_SOUND_MODE_WIRE_TIMEOUT_S = 5.0
+_SOUND_MODE_WIRE_POLL_S = 0.1
 
 # Debounce before actually tearing a stream down, so a track transition's
 # brief gap doesn't flap the Sendspin client every song.
@@ -148,6 +161,17 @@ class HALightGroupBridge:
         # arrives before the current flash finishes, so dragging a slider
         # doesn't stack up several overlapping flashes.
         self._flash_task: asyncio.Task[None] | None = None
+        # Resolved (briefly after start()) by _wire_sound_mode. None whenever
+        # Sound Mode control from Home Assistant isn't available yet/at all -
+        # every call site here treats that as "skip, nothing to mirror into".
+        # Deliberately untyped (not `Player | None`): this package must not
+        # import music_assistant's installed Player class just for a type
+        # hint on a value only ever read via getattr/setattr below - see
+        # _wire_sound_mode's docstring for why this whole mechanism is a
+        # runtime monkey-patch rather than the subclass hook the in-tree fork
+        # uses.
+        self._viz_player = None
+        self._client_id: str | None = None
 
     async def start(self) -> None:
         """Grab the Home Assistant connection and register as a Sendspin visualizer client."""
@@ -171,6 +195,7 @@ class HALightGroupBridge:
         self.restore_on_stop = self.provider.get_restore_on_stop()
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
+        self._client_id = client_id
 
         sendspin_prov: SendspinProvider | None = self.mass.get_provider("sendspin")  # type: ignore[assignment]
         if sendspin_prov:
@@ -211,6 +236,7 @@ class HALightGroupBridge:
             )
             viz_role.setup_visualizer(support)
         self._sendspin_client.attach_preinitialized_roles()
+        self.mass.create_task(self._wire_sound_mode())
 
         self.logger.info(
             "HA Lights bridge started for '%s' (%d entit%s configured)",
@@ -218,6 +244,88 @@ class HALightGroupBridge:
             len(self.entity_ids),
             "y" if len(self.entity_ids) == 1 else "ies",
         )
+
+    async def _wire_sound_mode(self) -> None:
+        """
+        Expose color_mode as this player's Home Assistant "Sound Mode" selector.
+
+        Lets color_mode be changed straight from Home Assistant (the
+        media_player's Sound Mode dropdown, or the select_sound_mode service)
+        instead of only from Music Assistant's own settings page.
+
+        This package runs as a plugin loaded via music-assistant-plugin-
+        manager's entrypoint discovery into a *stock, unmodified* Music
+        Assistant install (see this repo's Dockerfile/README) - it cannot add
+        a method to the installed SendspinVisualizerPlayer class the way the
+        in-tree fork does (music_assistant/providers/sendspin/player.py's
+        set_sound_mode_options), because that would mean patching Music
+        Assistant's own source tree, exactly what this package's whole
+        loading mechanism exists to avoid. Instead, this monkey-patches the
+        *instance* directly: sets the three attributes Music Assistant's own
+        Player/HA integration already read for this (_attr_sound_mode_list,
+        _attr_active_sound_mode, _attr_supported_features), and replaces the
+        instance's own select_sound_mode with a plain function (confirmed
+        safe - Player is a regular ABC with no __slots__, so an instance
+        attribute/method shadows the class one normally, and since it's set
+        directly on the instance rather than looked up via the class,
+        Python does NOT auto-bind `self` to it, hence the plain function
+        taking just `sound_mode` below).
+
+        Polls briefly for the Player object because it doesn't exist the
+        instant register_external_player returns - see
+        _SOUND_MODE_WIRE_TIMEOUT_S's comment for why.
+        """
+        assert self._client_id is not None  # set immediately before this is scheduled
+        deadline = time.monotonic() + _SOUND_MODE_WIRE_TIMEOUT_S
+        player = None
+        while time.monotonic() < deadline:
+            player = self.mass.players.get_player(self._client_id)
+            if player is not None:
+                break
+            await asyncio.sleep(_SOUND_MODE_WIRE_POLL_S)
+        if player is None:
+            self.logger.warning(
+                "Visualizer player for '%s' never appeared - color_mode won't be "
+                "changeable from Home Assistant this session (Music Assistant's own "
+                "settings page still works)",
+                self.group_name,
+            )
+            return
+        self._viz_player = player
+
+        async def _select_sound_mode(sound_mode: str) -> None:
+            """Instance-level replacement for Player.select_sound_mode - see docstring above."""
+            await self._on_sound_mode_selected(sound_mode)
+
+        player._attr_sound_mode_list = [  # noqa: SLF001 - see _wire_sound_mode's docstring
+            PlayerSoundMode(id=mode, name=mode.capitalize()) for mode in COLOR_MODES
+        ]
+        player._attr_active_sound_mode = self.provider.get_color_mode()  # noqa: SLF001
+        player._attr_supported_features.add(PlayerFeature.SELECT_SOUND_MODE)  # noqa: SLF001
+        player.select_sound_mode = _select_sound_mode
+        player.update_state()
+
+    async def _on_sound_mode_selected(self, mode: str) -> None:
+        """
+        Handle a color_mode change requested from Home Assistant's own UI/API.
+
+        Called by the select_sound_mode replacement _wire_sound_mode installs.
+        Persists the new value the same way a change made in Music
+        Assistant's own settings page would (so the two stay interchangeable
+        - whichever side you use, the other reflects it next time you look),
+        then applies it live via the usual update_settings path, then mirrors
+        the result back into the player's own state (the framework doesn't
+        do this for us the way it would for a real select_sound_mode method,
+        since ours isn't one).
+        """
+        if mode not in COLOR_MODES:
+            msg = f"{mode!r} is not a valid color_mode"
+            raise ValueError(msg)
+        self.provider.set_color_mode(mode)
+        self.update_settings(color_mode=mode)
+        if self._viz_player is not None:
+            self._viz_player._attr_active_sound_mode = mode  # noqa: SLF001
+            self._viz_player.update_state()
 
     async def stop(self) -> None:
         """Stop the bridge."""
@@ -249,6 +357,7 @@ class HALightGroupBridge:
         await self._restore_pre_sync_state()
 
         self._hass = None
+        self._viz_player = None
         self._is_streaming = False
         self.logger.debug("HA Lights bridge stopped for '%s'", self.group_name)
 
@@ -274,6 +383,14 @@ class HALightGroupBridge:
                 hue_lock_enabled=hue_lock_enabled,
                 hue_lock_deg=hue_lock_deg,
             )
+        # Mirrors a color_mode change made via Music Assistant's own settings
+        # page into Home Assistant's Sound Mode dropdown. The reverse
+        # direction (HA -> here) goes through _on_sound_mode_selected instead,
+        # which calls this same method - harmless if both run for the same
+        # value, not double-applied (just sets the same attribute twice).
+        if color_mode is not None and self._viz_player is not None:
+            self._viz_player._attr_active_sound_mode = color_mode  # noqa: SLF001
+            self._viz_player.update_state()
         # Not an analyzer concern - this is purely a bridge-level behavior
         # (what to do at stream-end), not anything rendered per-tick.
         if restore_on_stop is not None:

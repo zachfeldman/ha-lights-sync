@@ -209,6 +209,18 @@ class HALightsSyncProvider(PluginProvider):
         value = self.config.get_value(CONF_COLOR_MODE)
         return str(value) if value in COLOR_MODES else DEFAULT_COLOR_MODE
 
+    def set_color_mode(self, mode: str) -> None:
+        """
+        Persist a color_mode change initiated from outside Music Assistant's own config UI.
+
+        Specifically: Home Assistant's Sound Mode selector, via bridge.py's
+        _wire_sound_mode/_on_sound_mode_selected. Goes through the same
+        _update_config_value every other provider uses for a value that must
+        survive a restart, so this is indistinguishable from a change made in
+        Music Assistant's own settings page afterward.
+        """
+        self._update_config_value(CONF_COLOR_MODE, mode)
+
     def get_brightness(self) -> int:
         value = self.config.get_value(CONF_BRIGHTNESS)
         try:
