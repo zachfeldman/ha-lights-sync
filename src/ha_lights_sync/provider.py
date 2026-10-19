@@ -64,14 +64,12 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# Most color_mode options just need their name capitalized for a label (see
-# get_config_entries below); "strobe" gets an explicit override so the
-# photosensitivity risk is visible right in the dropdown, not just in the
-# README - someone scanning option names shouldn't be able to pick it
-# without seeing the warning.
-_COLOR_MODE_TITLES: dict[str, str] = {
-    "strobe": "Strobe (hard flashing - photosensitivity risk)",
-}
+# Every current color_mode option just needs its name capitalized for a
+# label (see get_config_entries below) - kept as a dict (rather than a
+# plain mode.capitalize() inline) since a future mode with a title that
+# needs more than capitalization (e.g. a safety warning, the way "strobe"
+# used to) can drop in here without changing the call site.
+_COLOR_MODE_TITLES: dict[str, str] = {}
 
 
 class HALightsSyncProvider(PluginProvider):
@@ -102,10 +100,10 @@ class HALightsSyncProvider(PluginProvider):
                 key=CONF_COLOR_MODE,
                 type=ConfigEntryType.STRING,
                 description=(
-                    "'Auto' picks between Smooth/Ambient/Energetic/Flashing on its own "
-                    "based on how energetic the music currently sounds, instead of staying "
-                    "on one fixed mode for the whole track. 'Strobe' is a hard on/off "
-                    "toggle, not a dim/brighten - see its own warning below."
+                    "How the lights react: 'Smooth'/'Ambient' are gentler, "
+                    "beat-driven color drift; 'Flashing' is high-contrast "
+                    "brightness on the beat; 'Pulse' tracks overall loudness "
+                    "continuously instead of flashing on individual beats."
                 ),
                 default_value=DEFAULT_COLOR_MODE,
                 options=[

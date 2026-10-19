@@ -731,32 +731,21 @@ class HALightGroupBridge:
         # what actually guards against this never returning at all.
         start = time.monotonic()
         try:
-            if command.on:
-                await self._hass.call_service(
-                    "light",
-                    "turn_on",
-                    service_data={
-                        "hs_color": [command.hue, command.saturation],
-                        "brightness_pct": command.brightness,
-                        # light.turn_on's transition is in seconds, unlike the
-                        # millisecond unit used everywhere else in this plugin
-                        # (matching python-kasa's/Hue's convention) - convert
-                        # here, at the one spot that actually calls the HA
-                        # service.
-                        "transition": command.transition_ms / 1000.0,
-                    },
-                    target={"entity_id": entity_id},
-                )
-            else:
-                # "strobe" mode's off phase - a real turn_off, not a dim
-                # floor (see analyzer.py's _ModePreset.hard_strobe). Same
-                # transition handling as turn_on, for consistency.
-                await self._hass.call_service(
-                    "light",
-                    "turn_off",
-                    service_data={"transition": command.transition_ms / 1000.0},
-                    target={"entity_id": entity_id},
-                )
+            await self._hass.call_service(
+                "light",
+                "turn_on",
+                service_data={
+                    "hs_color": [command.hue, command.saturation],
+                    "brightness_pct": command.brightness,
+                    # light.turn_on's transition is in seconds, unlike the
+                    # millisecond unit used everywhere else in this plugin
+                    # (matching python-kasa's/Hue's convention) - convert
+                    # here, at the one spot that actually calls the HA
+                    # service.
+                    "transition": command.transition_ms / 1000.0,
+                },
+                target={"entity_id": entity_id},
+            )
             elapsed_ms = round((time.monotonic() - start) * 1000)
             self.logger.debug("light.turn_on for %s took %dms", entity_id, elapsed_ms)
             # Only successful, non-stuck calls feed the pacing estimate - a
