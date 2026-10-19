@@ -136,7 +136,7 @@ DEFAULT_TRANSITION_STYLE: Final[str] = TRANSITION_STYLES[0]
 # How far ahead of "now" a render target is scheduled, to absorb command
 # round-trip time through Home Assistant's light.turn_on service (our own
 # call to HA's websocket API, then HA's own call to the light's integration,
-# e.g. Kasa/Hue/Zigbee - two network hops, not Hue Entertainment's dedicated
+# e.g. Hue/Zigbee/Wi-Fi - two network hops, not Hue Entertainment's dedicated
 # low-latency DTLS stream). Deliberately larger than Hue's own default (20ms)
 # - see README for the round trip this was tuned against.
 DEFAULT_HA_LATENCY_MS: Final[int] = 150
@@ -152,8 +152,9 @@ DEFAULT_HA_LATENCY_MS: Final[int] = 150
 #
 # 8Hz (125ms) rather than a more conservative rate because 2x/4x speed needs
 # the resolution to tell consecutive sub-beats apart - measured round trip
-# to real Kasa-via-HA hardware during development was 13-220ms (mostly
-# under 100ms), which mostly clears this budget but not always; a render
+# to real smart-light-via-HA hardware during early development (TP-Link
+# Kasa strips, specifically) was 13-220ms (mostly under 100ms), which mostly
+# clears this budget but not always; a render
 # tick landing on top of a still-in-flight one is skipped rather than
 # queued (see bridge.py's _dispatch_send), so very fast songs at 4x can
 # still visibly skip a pulse here and there - that's a real hardware/

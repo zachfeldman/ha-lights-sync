@@ -115,8 +115,13 @@ _PRESETS: dict[str, _ModePreset] = {
         floor=0.55, flash_strength=0.35, hue_drift_deg_s=6.0, hue_beat_jump_deg=15.0,
         saturation_floor=0.7, bass_weight=1.0,
     ),
+    # hue_beat_jump_deg confirmed too high during a real-hardware test (Oct
+    # 2026): at a 140 BPM track, 40deg/beat works out to a full 360deg hue
+    # wheel cycle in well under 2.5s, reading as "busy" rather than
+    # "ambient". Tuned down to 10deg/beat (~14s/cycle at the same tempo) -
+    # calmer, closer to smooth's own 15deg/beat than to energetic's 90.
     "ambient": _ModePreset(
-        floor=0.45, flash_strength=0.25, hue_drift_deg_s=3.0, hue_beat_jump_deg=40.0,
+        floor=0.45, flash_strength=0.25, hue_drift_deg_s=3.0, hue_beat_jump_deg=10.0,
         saturation_floor=0.4, bass_weight=1.0,
     ),
     "flashing": _ModePreset(

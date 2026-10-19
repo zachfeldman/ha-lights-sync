@@ -7,8 +7,8 @@ real-time audio analysis pipeline that powers Music Assistant's built-in
 [Hue Lights Sync](https://www.music-assistant.io/plugins/hue-entertainment/)
 plugin.
 
-If a light already works in Home Assistant — Kasa, Hue, LIFX, Zigbee,
-whatever — it works here. No device IPs, no separate pairing, no new
+If a light already works in Home Assistant — Hue, LIFX, Zigbee, Wi-Fi
+strips, whatever — it works here. No device IPs, no separate pairing, no new
 integration to set up: the light picker in this plugin's config is
 populated live from your existing Home Assistant entities.
 
@@ -50,11 +50,11 @@ You group the resulting "HA Lights: &lt;name&gt;" player with whatever real
 player is actually playing to the room, the same way you'd group a Hue
 Lights Sync player — see **Usage** below.
 
-**Why your lights don't just do this themselves:** some smart lights (e.g.
-TP-Link Kasa strips) do have a "Music" mode, but it typically only exists in
-the manufacturer's own phone app, using your phone's microphone — there's no
-local API call for it, so nothing server-side (Home Assistant, Music
-Assistant, or otherwise) can trigger it. This plugin gets real audio-reactive
+**Why your lights don't just do this themselves:** some smart lights do have
+a "Music" mode, but it typically only exists in the manufacturer's own phone
+app, using your phone's microphone — there's no local API call for it, so
+nothing server-side (Home Assistant, Music Assistant, or otherwise) can
+trigger it. This plugin gets real audio-reactive
 behavior onto whatever hardware you already have a different way: by driving
 `light.turn_on` calls directly from Music Assistant's own analysis of what
 it's playing.
@@ -408,8 +408,10 @@ the real beat so the actual downbeat still reads as the strongest hit
 How crisp this looks in practice has a real ceiling, and it's not this
 plugin's render loop (`RENDER_RATE_HZ` in `const.py` is 8Hz/125ms,
 specifically sized to resolve 2x/4x subdivisions) - it's the round trip
-through Home Assistant to your actual light. Measured against real TP-Link
-Kasa strips during development: 13-220ms, mostly under 100ms. At 4x on a
+through Home Assistant to your actual light. Measured against real smart-
+light hardware via HA during early development (TP-Link Kasa strips,
+specifically): 13-220ms, mostly under 100ms - your own number will vary by
+light/integration. At 4x on a
 fast track, sub-beats can land closer together than that round trip allows,
 and `bridge.py` deliberately **skips** a render rather than queuing it (so
 commands never arrive out of order) - logged as a `WARNING`

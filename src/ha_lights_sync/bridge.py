@@ -18,8 +18,9 @@ Music Assistant expects a lighting bridge to follow). What's different:
   own "Home Assistant" plugin (`mass.get_provider("hass").hass`, a
   `hass_client.HomeAssistantClient` - already connected/authenticated by that
   plugin, no separate config needed here). This is what makes the plugin
-  work with *any* light Home Assistant controls - Kasa, Hue, LIFX, Zigbee,
-  whatever - rather than needing its own device-specific transport per brand.
+  work with *any* light Home Assistant controls - Hue, LIFX, Zigbee, Wi-Fi
+  strips, whatever - rather than needing its own device-specific transport
+  per brand.
 - The render loop runs at RENDER_RATE_HZ (const.py), much lower than Hue's
   30Hz, because a service call is one request/response round trip (through
   HA's websocket API, then whatever HA does internally) rather than a
@@ -487,24 +488,25 @@ class HALightGroupBridge:
             return
         was_streaming = self._is_streaming
         snapshot: dict[str, dict] = {}
-        # DEBUG_INSTRUMENTATION (Oct 2026 real-hardware test session): the
-        # "Flashing N lights white..." INFO log below was confirmed to NEVER
-        # print, in the entire available log history, despite this method
-        # being invoked on every single live settings change (color_mode
-        # switch, specifically) - i.e. this coroutine is dying (or never
-        # actually running) before reaching its own first log line, totally
-        # silently: no "Task exception was never retrieved", nothing. That
-        # also lines up with 2 of the 7 color_modes tested (energetic, auto)
-        # visually freezing on a single static color for most of their
-        # window during a real-hardware run - consistent with this method's
-        # own self._cancel_render_loop() call succeeding but the matching
-        # self._start_render_loop() below never being reached, leaving the
-        # render loop dead until the next settings change's flash (if any)
-        # happens to succeed. Root cause not yet confirmed - this try/except
-        # exists purely to stop swallowing whatever is actually happening.
-        # The try/finally also means a crash here no longer leaves the
-        # render loop permanently stuck: the restart logic that used to live
-        # only in the "success" path now always runs, cancelled or not.
+        # DEBUG_INSTRUMENTATION (Oct 2026 real-hardware test session): added
+        # on the hypothesis that this coroutine was dying silently before
+        # its first log line, permanently stranding the render loop off.
+        # That hypothesis is now RULED OUT by a follow-up real-hardware run
+        # with debug logging enabled throughout: the "Flashing N lights
+        # white..." INFO log appeared on every single settings change, with
+        # zero exceptions ever logged here - this method runs to completion
+        # every time. The render loop still died silently for 3 of 7 tested
+        # color_modes (energetic, auto, strobe) in that same run, so
+        # whatever the real cause is, it is NOT in this method. See
+        # _render_tick/_start_render_loop/_cancel_render_loop for the
+        # DEBUG-level heartbeat logging added to localize it properly next
+        # time, instead of inferring from silence.
+        #
+        # Keeping the try/except/finally regardless: it is still a real
+        # correctness improvement independent of whether it was the actual
+        # bug - a crash here can no longer leave the render loop
+        # permanently stuck, since the restart logic that used to live only
+        # in the "success" path now always runs, cancelled or not.
         try:
             if was_streaming:
                 self._cancel_render_loop()
@@ -533,11 +535,14 @@ class HALightGroupBridge:
             # runs, so the render loop gets resumed either way.
             raise
         except Exception:
+            # Not the render-loop-death bug (see DEBUG_INSTRUMENTATION comment
+            # above - that hypothesis is ruled out) - but still worth a loud
+            # log if it ever happens, since the finally below is what keeps a
+            # real crash here from stranding the render loop regardless.
             self.logger.exception(
-                "DEBUG_INSTRUMENTATION: _flash_confirmation crashed for '%s' - this is "
-                "exactly the silent failure under investigation (see bridge.py's "
-                "DEBUG_INSTRUMENTATION comment above). Render loop restart below still "
-                "runs regardless, so lights shouldn't freeze even though this flash failed.",
+                "_flash_confirmation crashed for '%s' - render loop restart below "
+                "still runs regardless, so lights shouldn't freeze even though this "
+                "flash failed",
                 self.group_name,
             )
         finally:
@@ -575,15 +580,47 @@ class HALightGroupBridge:
 
     def _start_render_loop(self) -> None:
         if self._render_handle is not None:
+            # DEBUG_HEARTBEAT: not itself a bug - _start_render_loop is
+            # called from more than one place (_begin_streaming,
+            # _flash_confirmation's finally) - but logged so a trace can
+            # confirm this guard is actually what's short-circuiting a given
+            # call, rather than inferring it from the handle just existing.
+            self.logger.debug(
+                "_start_render_loop('%s'): already have a handle (id=%s) - no-op",
+                self.group_name,
+                id(self._render_handle),
+            )
             return
         self._render_handle = self.mass.loop.call_later(RENDER_PERIOD_S, self._render_tick)
+        self.logger.debug(
+            "_start_render_loop('%s'): scheduled tick, handle id=%s",
+            self.group_name,
+            id(self._render_handle),
+        )
 
     def _cancel_render_loop(self) -> None:
         if self._render_handle is not None:
+            self.logger.debug(
+                "_cancel_render_loop('%s'): cancelling handle id=%s",
+                self.group_name,
+                id(self._render_handle),
+            )
             self._render_handle.cancel()
             self._render_handle = None
+        else:
+            self.logger.debug("_cancel_render_loop('%s'): no handle to cancel", self.group_name)
 
     def _render_tick(self) -> None:
+        # DEBUG_HEARTBEAT: this is the one line that proves the call_later
+        # chain is still alive at all - added after a real-hardware test
+        # (Oct 2026) showed total log silence for 10-20+s stretches on 3 of
+        # 7 color_modes (energetic, auto, strobe) with no exception ever
+        # logged, which _render_tick's own try/except should have caught if
+        # the cause were an exception inside render()/_dispatch_send. Ruling
+        # that out (or confirming this line itself goes silent) is the next
+        # real-hardware run's first job - see README/CLAUDE.md notes on this
+        # investigation for what's already been ruled out.
+        self.logger.debug("_render_tick('%s'): fired, streaming=%s", self.group_name, self._is_streaming)
         self._render_handle = None
         if not self._is_streaming:
             return
@@ -598,6 +635,16 @@ class HALightGroupBridge:
         finally:
             if self._is_streaming:
                 self._render_handle = self.mass.loop.call_later(RENDER_PERIOD_S, self._render_tick)
+                self.logger.debug(
+                    "_render_tick('%s'): rescheduled, handle id=%s",
+                    self.group_name,
+                    id(self._render_handle),
+                )
+            else:
+                self.logger.debug(
+                    "_render_tick('%s'): not rescheduling, streaming went False mid-tick",
+                    self.group_name,
+                )
 
     def _dispatch_send(self, entity_id: str, command: LightCommand) -> None:
         """
