@@ -1,5 +1,14 @@
 # HA Lights Sync
 
+> **Archived.** Development moved in-tree, to
+> [`music_assistant/providers/ha_lights_sync/`](https://github.com/zachfeldman/server/tree/add-ha-lights-sync-plugin/music_assistant/providers/ha_lights_sync)
+> on a fork of `music-assistant/server` - plugins there are just built-in
+> providers, not separately-repo'd pip packages, so that's the actual PR
+> destination. This repo's `main` is frozen at its last state before that
+> move; the [`pre-fork-archive`](https://github.com/zachfeldman/ha-lights-sync/tree/pre-fork-archive)
+> branch is an identical copy kept under an unambiguous name in case `main`
+> ever moves. Nothing here is being developed further - go to the fork.
+
 A [Music Assistant](https://music-assistant.io) plugin that syncs **any
 Home Assistant light** to music in real time — brightness pulses on the
 beat, color drifts and jumps with the track, all driven by the same
