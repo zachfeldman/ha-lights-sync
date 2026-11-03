@@ -276,6 +276,35 @@ to you:
   if you hit it, not this repo - there's nothing in `ha-lights-sync` that
   can work around it.
 
+**The render loop can still freeze on real hardware, with no errors
+logged.** Confirmed in production (2026-10-30, fixed by `55c68f6`, then
+apparently recurred 2026-11-02/03) - lights stop reacting to music and sit
+on one static color while the Sendspin stream keeps running normally in
+the logs. The `55c68f6` fix addresses the one confirmed root cause (a
+`light.turn_on` ack getting stuck behind a large websocket backlog on busy
+Home Assistant instances - see `CALL_SERVICE_TIMEOUT_S`'s history in
+`const.py`), but the 2026-11 recurrence wasn't conclusively tied back to
+that same mechanism before a Music Assistant add-on restart cleared it -
+possibly a stale deployment rather than a new bug (see this plugin's
+consuming add-on repo for a documented "rebuild can silently reuse a stale
+local clone" gotcha), possibly something else. Two things added
+2026-11-03 so the *next* occurrence is actually diagnosable instead of
+inferred from "a restart fixed it":
+- An always-on (INFO level, no debug flag needed) heartbeat logged every
+  `HEARTBEAT_INTERVAL_S` while streaming, and a watchdog that notices a
+  stalled render loop and restarts just that bridge - see `const.py`'s
+  "Render-loop observability/self-heal" comment for the full design
+  rationale, including a real logger-wiring bug found while building this
+  (this plugin's own debug logging was invisible to the add-on's
+  `log_level` option the entire time, regardless of this specific freeze -
+  fixed in the same change).
+- If you hit this, check the add-on's normal (non-debug) logs for this
+  plugin's `Heartbeat for '<group>':` lines first - they'll show whether
+  the render loop is alive-but-not-sending, or dead outright (in which
+  case you should also see an `ERROR`-level "has not ticked in Ns" line
+  from the watchdog, and the lights should self-recover within
+  `WATCHDOG_INTERVAL_S` of that).
+
 ## Configuration
 
 | Setting | Description |

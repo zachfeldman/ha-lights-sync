@@ -162,6 +162,52 @@ RENDER_PERIOD_S: Final[float] = 1.0 / RENDER_RATE_HZ
 # and wall-clock elapsed time is used instead.
 CALL_SERVICE_TIMEOUT_S: Final[float] = 3.0
 
+# -- Render-loop observability/self-heal (added Nov 2026) --
+#
+# Added after a real-hardware incident (2026-11-02/03) where the render
+# loop froze lights on a static color for an extended stretch with *zero*
+# errors or warnings in the normal (INFO-level) logs - the only way to see
+# anything was manually flipping the whole Music Assistant add-on to DEBUG
+# logging and restarting it, which is too slow/disruptive to do live every
+# time this happens, and still came back inconclusive: bridge.py's own
+# DEBUG-level logging (self.logger, a child of the top-level `ha_lights_sync`
+# logger) turned out to be invisible to the add-on's "log_level" option
+# entirely - see this file's `self.logger = provider.logger.getChild(...)`
+# fix in bridge.py's __init__ for why (the add-on only ever set the
+# `music_assistant` logger tree's level; this plugin's logger was a
+# disconnected top-level one that always ran at the root logger's default,
+# INFO, regardless of that setting). A restart of the add-on happened to
+# clear the freeze (consistent with the already-fixed stuck-ack theory in
+# CALL_SERVICE_TIMEOUT_S's history, if that fix wasn't actually live yet -
+# Supervisor's custom-repo add-ons have a known failure mode where a
+# `rebuild` can silently reuse a stale local clone of the add-on repo, see
+# this project's deployment notes), but that was never confirmed against
+# real evidence, just inferred from "the restart fixed it."
+#
+# Two independent additions to close that gap:
+#   1. An always-on (INFO level - no debug flag needed) heartbeat, logged
+#      periodically by _render_tick while streaming, giving a plain-log
+#      trail of tick/send/skip counts. If this stops appearing, the render
+#      loop's call_later chain itself has died. If it keeps appearing with
+#      a high skip count, sends are going out but not landing/being
+#      acknowledged (the symptom this whole investigation has chased).
+#   2. A watchdog, independent of the render loop's own scheduling, that
+#      notices the render loop hasn't actually ticked in a while despite
+#      still being asked to stream, logs it at ERROR (so it's impossible to
+#      miss in a normal-level log sweep), and self-heals by restarting just
+#      this bridge's render loop - not the whole Music Assistant process,
+#      which would interrupt every room's audio to fix one room's lights.
+#
+# How often the heartbeat logs, while actively streaming.
+HEARTBEAT_INTERVAL_S: Final[float] = 15.0
+# How often the watchdog checks for a stalled render loop.
+WATCHDOG_INTERVAL_S: Final[float] = 10.0
+# If the render loop hasn't ticked in this long while still marked as
+# streaming, treat it as stalled. Well above RENDER_PERIOD_S (0.125s at the
+# default 8Hz) and CALL_SERVICE_TIMEOUT_S (3s) combined, so normal per-tick
+# jitter or an in-progress stuck-call recovery never false-positives this.
+WATCHDOG_STALL_THRESHOLD_S: Final[float] = 8.0
+
 # 12 mel bins is plenty for a 2-zone bass/treble split; keeps the requested
 # payload small. See music_assistant/providers/hue_entertainment/constants.py
 # for the prior art this mirrors (it uses 17 bins across its multi-channel

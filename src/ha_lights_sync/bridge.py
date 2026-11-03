@@ -35,7 +35,6 @@ Music Assistant expects a lighting bridge to follow). What's different:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
@@ -55,6 +54,7 @@ from .const import (
     CALL_SERVICE_TIMEOUT_S,
     DEFAULT_RESTORE_ON_STOP,
     ENTITY_LATENCY_SAFETY_FACTOR,
+    HEARTBEAT_INTERVAL_S,
     RENDER_PERIOD_S,
     RESTORE_TRANSITION_S,
     SETTINGS_FLASH_S,
@@ -63,6 +63,8 @@ from .const import (
     SPECTRUM_F_MIN,
     SPECTRUM_SCALE,
     VISUALIZER_RATE_HZ,
+    WATCHDOG_INTERVAL_S,
+    WATCHDOG_STALL_THRESHOLD_S,
 )
 
 # Color attributes a light state can carry, in the order we'll prefer them
@@ -82,7 +84,23 @@ if TYPE_CHECKING:
     from .analyzer import LightCommand
     from .provider import HALightsSyncProvider
 
-LOGGER = logging.getLogger(__name__)
+# Deliberately NOT `self.logger = logging.getLogger(__name__).getChild(...)`
+# (a bare top-level `ha_lights_sync.*` logger) as this used to be - found
+# Nov 2026 while chasing a render-loop-freeze incident that debug logging
+# should have caught and didn't: Music Assistant's add-on "log_level"
+# option (__main__.py's setup_logger) only ever sets the level on the
+# `music_assistant` logger tree (`logging.getLogger(MASS_LOGGER_NAME)`),
+# via each Provider's own `self.logger` (see provider.py's
+# `_set_log_level_from_config`, which `HALightsSyncProvider.logger` already
+# goes through correctly). A disconnected top-level `ha_lights_sync` logger
+# is invisible to that entirely - it just runs at the root logger's
+# hardcoded INFO default (see __main__.py's `logging.basicConfig`) no
+# matter what the add-on's log_level dropdown says, which is why every
+# DEBUG_HEARTBEAT line this file has accumulated across several past
+# real-hardware debugging sessions silently never printed even with
+# "debug" selected and the add-on restarted. Child-ing off the *provider's*
+# logger instead makes this bridge's logging actually obey that setting,
+# same as everything else in the provider.
 
 # Debounce before actually tearing a stream down, so a track transition's
 # brief gap doesn't flap the Sendspin client every song.
@@ -110,7 +128,7 @@ class HALightGroupBridge:
         self.group_name = group_name
         self.entity_ids = entity_ids
         self.sendspin_server = sendspin_server
-        self.logger = LOGGER.getChild(f"bridge.{group_name}")
+        self.logger = provider.logger.getChild(f"bridge.{group_name}")
 
         self._analyzer: HALightsAudioAnalyzer | None = None
         self._hass: HomeAssistantClient | None = None
@@ -130,6 +148,23 @@ class HALightGroupBridge:
         self._is_streaming = False
         self._stop_debounce_task: asyncio.Task[None] | None = None
         self._render_handle: asyncio.TimerHandle | None = None
+        # -- Render-loop observability/self-heal (see const.py's
+        # HEARTBEAT_INTERVAL_S/WATCHDOG_* comment for the incident this was
+        # added for) --
+        # Wall-clock time of the last _render_tick invocation, updated
+        # unconditionally at the top of that method (before its own
+        # try/except) - this is the one signal the watchdog trusts, since
+        # it's set by the tick firing at all, independent of whether
+        # anything inside the tick succeeds.
+        self._last_tick_mono: float | None = None
+        self._watchdog_handle: asyncio.TimerHandle | None = None
+        # Counters accumulated between heartbeat logs, reset to 0 each time
+        # one fires - see _render_tick/_dispatch_send/_maybe_log_heartbeat.
+        self._hb_ticks = 0
+        self._hb_sent = 0
+        self._hb_skipped_inflight = 0
+        self._hb_stuck_recovered = 0
+        self._last_heartbeat_mono: float | None = None
         # Whether to put each light back how it was before the stream
         # started once it really ends - see _capture_pre_sync_state/
         # _restore_pre_sync_state. Set from the provider's own setting in
@@ -222,6 +257,7 @@ class HALightGroupBridge:
     async def stop(self) -> None:
         """Stop the bridge."""
         self._cancel_render_loop()
+        self._cancel_watchdog()
         if self._stop_debounce_task and not self._stop_debounce_task.done():
             self._stop_debounce_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -347,6 +383,7 @@ class HALightGroupBridge:
                 _PRE_SYNC_SNAPSHOT_BUDGET_S,
             )
         self._start_render_loop()
+        self._start_watchdog()
 
     def _on_stream_end(self) -> None:
         if self._is_streaming:
@@ -364,6 +401,8 @@ class HALightGroupBridge:
             self.logger.info("Visualizer stream ended for '%s'", self.group_name)
             self._is_streaming = False
             self._cancel_render_loop()
+            self._cancel_watchdog()
+            self._last_tick_mono = None
             await self._restore_pre_sync_state()
 
     def _on_visualizer_frame(self, frame: ExtractedFrame) -> None:
@@ -620,9 +659,15 @@ class HALightGroupBridge:
         # real-hardware run's first job - see README/CLAUDE.md notes on this
         # investigation for what's already been ruled out.
         self.logger.debug("_render_tick('%s'): fired, streaming=%s", self.group_name, self._is_streaming)
+        # Set unconditionally, before anything that could raise - this is
+        # the one signal _watchdog_tick trusts to mean "the call_later chain
+        # is still alive", independent of whether the rest of this tick
+        # succeeds. See const.py's WATCHDOG_STALL_THRESHOLD_S comment.
+        self._last_tick_mono = time.monotonic()
         self._render_handle = None
         if not self._is_streaming:
             return
+        self._hb_ticks += 1
         try:
             if self._analyzer is not None:
                 now_s = self.sendspin_server.clock.now_us() / 1_000_000
@@ -644,6 +689,82 @@ class HALightGroupBridge:
                     "_render_tick('%s'): not rescheduling, streaming went False mid-tick",
                     self.group_name,
                 )
+        self._maybe_log_heartbeat()
+
+    def _maybe_log_heartbeat(self) -> None:
+        """
+        Log a plain INFO-level health summary every HEARTBEAT_INTERVAL_S while streaming.
+
+        Deliberately INFO, not DEBUG: the whole point is a trail that's
+        visible in this add-on's normal logs with no special log_level
+        flipped on ahead of time - see const.py's HEARTBEAT_INTERVAL_S
+        comment for the incident that motivated this. If this line stops
+        appearing, the render loop itself has died (or _watchdog_tick has
+        already restarted it - check for its ERROR line). If it keeps
+        appearing with sent=0 or a high skipped/recovered count, the loop
+        is alive but commands aren't landing.
+        """
+        now = time.monotonic()
+        if self._last_heartbeat_mono is None:
+            self._last_heartbeat_mono = now
+            return
+        elapsed = now - self._last_heartbeat_mono
+        if elapsed < HEARTBEAT_INTERVAL_S:
+            return
+        self.logger.info(
+            "Heartbeat for '%s': %d ticks, %d sent, %d skipped (in-flight), "
+            "%d stuck-recovered in the last %.0fs",
+            self.group_name,
+            self._hb_ticks,
+            self._hb_sent,
+            self._hb_skipped_inflight,
+            self._hb_stuck_recovered,
+            elapsed,
+        )
+        self._hb_ticks = 0
+        self._hb_sent = 0
+        self._hb_skipped_inflight = 0
+        self._hb_stuck_recovered = 0
+        self._last_heartbeat_mono = now
+
+    # -- Watchdog: independent liveness check for the render loop --
+    #
+    # See const.py's WATCHDOG_INTERVAL_S/WATCHDOG_STALL_THRESHOLD_S comment
+    # for why this exists as a *separate* call_later chain rather than
+    # folding the check into _render_tick itself: if the render loop's own
+    # chain is what died, nothing inside it can notice that. This one runs
+    # independently so it can.
+
+    def _start_watchdog(self) -> None:
+        if self._watchdog_handle is not None:
+            return
+        self._watchdog_handle = self.mass.loop.call_later(WATCHDOG_INTERVAL_S, self._watchdog_tick)
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog_handle is not None:
+            self._watchdog_handle.cancel()
+            self._watchdog_handle = None
+
+    def _watchdog_tick(self) -> None:
+        self._watchdog_handle = None
+        if not self._is_streaming:
+            return
+        if self._last_tick_mono is not None:
+            stall_s = time.monotonic() - self._last_tick_mono
+            if stall_s > WATCHDOG_STALL_THRESHOLD_S:
+                self.logger.error(
+                    "Render loop for '%s' has not ticked in %.1fs (threshold %.0fs) "
+                    "despite still streaming - restarting it. This should not happen "
+                    "after the send_command_no_wait fix; if you see this, the render "
+                    "loop died some other way and this log line is the evidence to "
+                    "chase next, not the stuck-ack bug that fix already closed.",
+                    self.group_name,
+                    stall_s,
+                    WATCHDOG_STALL_THRESHOLD_S,
+                )
+                self._cancel_render_loop()
+                self._start_render_loop()
+        self._watchdog_handle = self.mass.loop.call_later(WATCHDOG_INTERVAL_S, self._watchdog_tick)
 
     def _dispatch_send(self, entity_id: str, command: LightCommand) -> None:
         """
@@ -693,6 +814,7 @@ class HALightGroupBridge:
                     CALL_SERVICE_TIMEOUT_S,
                 )
                 pending.cancel()  # best-effort; we don't wait to see if it takes
+                self._hb_stuck_recovered += 1
             else:
                 # Logged at WARNING (not just debug) on purpose: a user tuning
                 # Speed up to 2x/4x needs an easy way to tell "my lights/
@@ -703,6 +825,7 @@ class HALightGroupBridge:
                 self.logger.warning(
                     "Skipped render for %s - previous light.turn_on still in flight", entity_id
                 )
+                self._hb_skipped_inflight += 1
                 return
         else:
             # Previous send (if any) already completed - but if THIS entity
@@ -721,6 +844,7 @@ class HALightGroupBridge:
         self._pending_send[entity_id] = self.mass.create_task(
             self._send_command(entity_id, command)
         )
+        self._hb_sent += 1
 
     async def _send_command(self, entity_id: str, command: LightCommand) -> None:
         """
