@@ -35,9 +35,12 @@ Music Assistant expects a lighting bridge to follow). What's different:
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import time
+from collections.abc import Callable
 from contextlib import suppress
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aiosendspin.models.core import ClientHelloPayload
 from aiosendspin.models.core import DeviceInfo as SendspinDeviceInfo
@@ -45,13 +48,16 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSpectrum,
     ClientHelloVisualizerSupport,
 )
-from music_assistant_models.enums import PlayerType
+from music_assistant_models.enums import PlayerFeature, PlayerType
+from music_assistant_models.player import PlayerSoundMode
 
 from music_assistant.providers.sendspin.bridge_role import VISUALIZER_BRIDGE_ROLE_ID, BridgeVisualizerRole
 
 from .analyzer import HALightsAudioAnalyzer
 from .const import (
+    BEAT_MULTIPLIERS,
     CALL_SERVICE_TIMEOUT_S,
+    COLOR_MODES,
     DEFAULT_RESTORE_ON_STOP,
     ENTITY_LATENCY_SAFETY_FACTOR,
     HEARTBEAT_INTERVAL_S,
@@ -72,6 +78,29 @@ from .const import (
 # _build_restore_service_data). hs_color first since it's what we send
 # ourselves during sync, so it's the most common case to restore exactly.
 _RESTORE_COLOR_ATTRS: tuple[str, ...] = ("hs_color", "rgb_color", "xy_color", "color_temp_kelvin")
+
+# Settings exposed as dedicated Home Assistant helper entities (input_number/
+# input_select/input_boolean), two-way synced by _wire_settings_helpers - see
+# that method's docstring for why these get their own entities instead of
+# overloading Sound Mode (already spent on color_mode) or Source (which only
+# has room for one more single enum axis, see _wire_settings_helpers).
+# key -> (domain, entity_id suffix). The full entity_id is
+# f"{domain}.{_settings_helper_slug()}_{suffix}".
+_SETTINGS_HELPERS: dict[str, tuple[str, str]] = {
+    "brightness": ("input_number", "brightness"),
+    "beat_multiplier": ("input_select", "speed"),
+    "transition_style": ("input_select", "transition_style"),
+    "sensitivity": ("input_number", "sensitivity"),
+    "hue_lock_enabled": ("input_boolean", "hue_lock"),
+    "hue_lock_deg": ("input_number", "hue_lock_deg"),
+    "restore_on_stop": ("input_boolean", "restore_on_stop"),
+}
+
+# input_select options for beat_multiplier ("Speed") don't speak MA's plain
+# ints (1/2/4) - HA's own dropdown needs string option labels. Both
+# directions of this map are used (push: int -> "Nx", pull: "Nx" -> int).
+_BEAT_MULTIPLIER_TO_OPTION: dict[int, str] = {n: f"{n}x" for n in BEAT_MULTIPLIERS}
+_OPTION_TO_BEAT_MULTIPLIER: dict[str, int] = {v: k for k, v in _BEAT_MULTIPLIER_TO_OPTION.items()}
 
 if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
@@ -101,6 +130,17 @@ if TYPE_CHECKING:
 # "debug" selected and the add-on restarted. Child-ing off the *provider's*
 # logger instead makes this bridge's logging actually obey that setting,
 # same as everything else in the provider.
+
+# How long _wire_sound_mode will wait for the Sendspin provider to actually
+# create this bridge's visualizer Player object before giving up. It doesn't
+# exist the instant register_external_player returns - the installed Music
+# Assistant server creates it from a fire-and-forget task kicked off by its
+# own client-added event handling, so there's a real (normally very short)
+# async gap. Giving up after this just means Sound Mode selection won't be
+# available from Home Assistant for this session - everything else about the
+# bridge is unaffected.
+_SOUND_MODE_WIRE_TIMEOUT_S = 5.0
+_SOUND_MODE_WIRE_POLL_S = 0.1
 
 # Debounce before actually tearing a stream down, so a track transition's
 # brief gap doesn't flap the Sendspin client every song.
@@ -183,6 +223,32 @@ class HALightGroupBridge:
         # arrives before the current flash finishes, so dragging a slider
         # doesn't stack up several overlapping flashes.
         self._flash_task: asyncio.Task[None] | None = None
+        # Resolved (briefly after start()) by _wire_sound_mode. None whenever
+        # Sound Mode control from Home Assistant isn't available yet/at all -
+        # every call site here treats that as "skip, nothing to mirror into".
+        # Deliberately untyped (not `Player | None`): this package must not
+        # import music_assistant's installed Player class just for a type
+        # hint on a value only ever read via getattr/setattr below - see
+        # _wire_sound_mode's docstring for why this whole mechanism is a
+        # runtime monkey-patch rather than the subclass hook the in-tree fork
+        # uses.
+        self._viz_player = None
+        self._client_id: str | None = None
+        # Unsubscribe callback from _wire_settings_helpers' subscribe_events
+        # call, if wiring succeeded. None whenever settings-helper sync isn't
+        # active (not yet wired, or stop() already tore it down).
+        self._settings_helpers_unsub: Callable[[], None] | None = None
+        # entity_id -> settings key, built once by _wire_settings_helpers for
+        # O(1) lookup in _on_settings_helper_event - see that method.
+        self._settings_helper_entity_ids: dict[str, str] = {}
+        # entity_id -> last value *we* pushed to that helper via call_service,
+        # so _on_hass_event can tell "HA echoing our own write back" (skip -
+        # already applied, re-persisting would just be a redundant config
+        # write) apart from "the user actually changed this on the dashboard"
+        # (apply it). Compared by value, not by "did WE just write", since
+        # HomeAssistantClient gives no cheaper way to tag a service call's
+        # resulting state-change event as self-caused.
+        self._last_pushed_helper_values: dict[str, Any] = {}
 
     async def start(self) -> None:
         """Grab the Home Assistant connection and register as a Sendspin visualizer client."""
@@ -206,6 +272,7 @@ class HALightGroupBridge:
         self.restore_on_stop = self.provider.get_restore_on_stop()
 
         client_id = f"ha-lights-{self.group_name.lower().replace(' ', '-')[:24]}"
+        self._client_id = client_id
 
         sendspin_prov: SendspinProvider | None = self.mass.get_provider("sendspin")  # type: ignore[assignment]
         if sendspin_prov:
@@ -246,6 +313,8 @@ class HALightGroupBridge:
             )
             viz_role.setup_visualizer(support)
         self._sendspin_client.attach_preinitialized_roles()
+        self.mass.create_task(self._wire_sound_mode())
+        self.mass.create_task(self._wire_settings_helpers())
 
         self.logger.info(
             "HA Lights bridge started for '%s' (%d entit%s configured)",
@@ -254,10 +323,293 @@ class HALightGroupBridge:
             "y" if len(self.entity_ids) == 1 else "ies",
         )
 
+    async def _wire_sound_mode(self) -> None:
+        """
+        Expose color_mode as this player's Home Assistant "Sound Mode" selector.
+
+        Lets color_mode be changed straight from Home Assistant (the
+        media_player's Sound Mode dropdown, or the select_sound_mode service)
+        instead of only from Music Assistant's own settings page.
+
+        This package runs as a plugin loaded via music-assistant-plugin-
+        manager's entrypoint discovery into a *stock, unmodified* Music
+        Assistant install (see this repo's Dockerfile/README) - it cannot add
+        a method to the installed SendspinVisualizerPlayer class the way the
+        in-tree fork does (music_assistant/providers/sendspin/player.py's
+        set_sound_mode_options), because that would mean patching Music
+        Assistant's own source tree, exactly what this package's whole
+        loading mechanism exists to avoid. Instead, this monkey-patches the
+        *instance* directly: sets the three attributes Music Assistant's own
+        Player/HA integration already read for this (_attr_sound_mode_list,
+        _attr_active_sound_mode, _attr_supported_features), and replaces the
+        instance's own select_sound_mode with a plain function (confirmed
+        safe - Player is a regular ABC with no __slots__, so an instance
+        attribute/method shadows the class one normally, and since it's set
+        directly on the instance rather than looked up via the class,
+        Python does NOT auto-bind `self` to it, hence the plain function
+        taking just `sound_mode` below).
+
+        Polls briefly for the Player object because it doesn't exist the
+        instant register_external_player returns - see
+        _SOUND_MODE_WIRE_TIMEOUT_S's comment for why.
+        """
+        assert self._client_id is not None  # set immediately before this is scheduled
+        deadline = time.monotonic() + _SOUND_MODE_WIRE_TIMEOUT_S
+        player = None
+        while time.monotonic() < deadline:
+            player = self.mass.players.get_player(self._client_id)
+            if player is not None:
+                break
+            await asyncio.sleep(_SOUND_MODE_WIRE_POLL_S)
+        if player is None:
+            self.logger.warning(
+                "Visualizer player for '%s' never appeared - color_mode won't be "
+                "changeable from Home Assistant this session (Music Assistant's own "
+                "settings page still works)",
+                self.group_name,
+            )
+            return
+        self._viz_player = player
+
+        async def _select_sound_mode(sound_mode: str) -> None:
+            """Instance-level replacement for Player.select_sound_mode - see docstring above."""
+            await self._on_sound_mode_selected(sound_mode)
+
+        player._attr_sound_mode_list = [  # noqa: SLF001 - see _wire_sound_mode's docstring
+            PlayerSoundMode(id=mode, name=mode.capitalize()) for mode in COLOR_MODES
+        ]
+        player._attr_active_sound_mode = self.provider.get_color_mode()  # noqa: SLF001
+        player._attr_supported_features.add(PlayerFeature.SELECT_SOUND_MODE)  # noqa: SLF001
+        player.select_sound_mode = _select_sound_mode
+        player.update_state()
+
+    async def _on_sound_mode_selected(self, mode: str) -> None:
+        """
+        Handle a color_mode change requested from Home Assistant's own UI/API.
+
+        Called by the select_sound_mode replacement _wire_sound_mode installs.
+        Persists the new value the same way a change made in Music
+        Assistant's own settings page would (so the two stay interchangeable
+        - whichever side you use, the other reflects it next time you look),
+        then applies it live via the usual update_settings path, then mirrors
+        the result back into the player's own state (the framework doesn't
+        do this for us the way it would for a real select_sound_mode method,
+        since ours isn't one).
+        """
+        if mode not in COLOR_MODES:
+            msg = f"{mode!r} is not a valid color_mode"
+            raise ValueError(msg)
+        self.provider.set_color_mode(mode)
+        self.update_settings(color_mode=mode)
+        if self._viz_player is not None:
+            self._viz_player._attr_active_sound_mode = mode  # noqa: SLF001
+            self._viz_player.update_state()
+
+    def _settings_helper_slug(self) -> str:
+        """Entity_id prefix for this bridge's settings helpers, derived from its own group_name."""
+        slug = re.sub(r"[^a-z0-9]+", "_", self.group_name.lower()).strip("_")
+        return slug or "ha_lights_sync"
+
+    def _settings_helper_entity_id(self, key: str) -> str:
+        domain, suffix = _SETTINGS_HELPERS[key]
+        return f"{domain}.{self._settings_helper_slug()}_{suffix}"
+
+    async def _wire_settings_helpers(self) -> None:
+        """
+        Two-way sync brightness/Speed/transition style/sensitivity/Lock color/
+        locked hue/restore-on-stop with dedicated Home Assistant helper
+        entities (input_number/input_select/input_boolean - see
+        _SETTINGS_HELPERS), so they're controllable from a dashboard the same
+        way color_mode already is via Sound Mode.
+
+        Why not the same Sound Mode trick _wire_sound_mode uses: that slot is
+        already spent on color_mode. Source (HA's other media_player enum
+        selector, PlayerFeature.SELECT_SOURCE) is a real second slot but only
+        one - there isn't a matching native media_player slot for a
+        multi-value "set of settings" at all. Home Assistant's own
+        music_assistant integration doesn't read Music Assistant's
+        PlayerFeature.OPTIONS/Player.options either (checked against its
+        installed source - no select/number/switch entity or attribute comes
+        from it), so that's not a path today. Dedicated helper entities,
+        kept in sync directly by this bridge (which already holds its own
+        authenticated HomeAssistantClient for light control - see this
+        file's module docstring), are the honest way to get real two-way
+        dashboard control of every setting without forcing a bad fit onto a
+        media_player slot that doesn't have room for it.
+
+        Seeds each helper with the provider's current value on start, then
+        subscribes (via subscribe_entities, scoped to just these entity_ids -
+        not every state_changed event in the house) and applies the new
+        value live (provider.set_<x> to persist + update_settings to apply,
+        mirroring _on_sound_mode_selected) whenever one changes - except for
+        changes that just echo a value this bridge itself pushed a moment
+        ago (see _last_pushed_helper_values), which would otherwise be a
+        no-op config write on every push.
+        """
+        if self._hass is None:
+            return
+        try:
+            await self._push_settings_helpers()
+            # entity_id -> key, built once here rather than recomputed per
+            # event - subscribe_entities already scopes the subscription to
+            # just these entity_ids server-side, so this is purely for O(1)
+            # lookup inside the (still real-time) event callback itself.
+            self._settings_helper_entity_ids = {
+                self._settings_helper_entity_id(k): k for k in _SETTINGS_HELPERS
+            }
+            self._settings_helpers_unsub = await self._hass.subscribe_entities(
+                self._on_settings_helper_event, list(self._settings_helper_entity_ids)
+            )
+        except Exception:
+            self.logger.warning(
+                "Could not wire dashboard settings helpers for '%s' - Music Assistant's "
+                "own settings page still works",
+                self.group_name,
+                exc_info=True,
+            )
+
+    async def _push_settings_helpers(self) -> None:
+        """Write the provider's current setting values into their paired HA helper entities."""
+        assert self._hass is not None
+        # (key, domain, service, service_data, echo_value) - echo_value is
+        # what _on_settings_helper_event will see as the resulting state
+        # after this call lands, in the same type/shape its own parsing
+        # produces (so the echo-suppression equality check in that method
+        # actually matches) - recorded in _last_pushed_helper_values below.
+        brightness = self.provider.get_brightness()
+        beat_multiplier = self.provider.get_beat_multiplier()
+        transition_style = self.provider.get_transition_style()
+        sensitivity = self.provider.get_sensitivity()
+        hue_lock_enabled = self.provider.get_hue_lock_enabled()
+        hue_lock_deg = self.provider.get_hue_lock_deg()
+        restore_on_stop = self.provider.get_restore_on_stop()
+        pushes: list[tuple[str, str, str, dict[str, Any], Any]] = [
+            ("brightness", "input_number", "set_value", {"value": brightness}, brightness),
+            (
+                "beat_multiplier",
+                "input_select",
+                "select_option",
+                {"option": _BEAT_MULTIPLIER_TO_OPTION[beat_multiplier]},
+                beat_multiplier,
+            ),
+            (
+                "transition_style",
+                "input_select",
+                "select_option",
+                {"option": transition_style},
+                transition_style,
+            ),
+            ("sensitivity", "input_number", "set_value", {"value": sensitivity}, sensitivity),
+            (
+                "hue_lock_enabled",
+                "input_boolean",
+                "turn_on" if hue_lock_enabled else "turn_off",
+                {},
+                hue_lock_enabled,
+            ),
+            ("hue_lock_deg", "input_number", "set_value", {"value": hue_lock_deg}, hue_lock_deg),
+            (
+                "restore_on_stop",
+                "input_boolean",
+                "turn_on" if restore_on_stop else "turn_off",
+                {},
+                restore_on_stop,
+            ),
+        ]
+        for key, domain, service, service_data, echo_value in pushes:
+            entity_id = self._settings_helper_entity_id(key)
+            self._last_pushed_helper_values[entity_id] = echo_value
+            try:
+                await self._hass.call_service(
+                    domain, service, service_data=service_data or None, target={"entity_id": entity_id}
+                )
+            except Exception:
+                self.logger.debug(
+                    "Could not seed settings helper %s for '%s'",
+                    entity_id,
+                    self.group_name,
+                    exc_info=True,
+                )
+
+    async def _on_settings_helper_event(self, event: dict[str, Any]) -> None:
+        """
+        Handle a compressed entity-state event from subscribe_entities.
+
+        Shape (see hass_client.models.EntityStateEvent): {"a": {entity_id:
+        CompressedState}} for the first message after subscribing (or a
+        newly-added entity), {"c": {entity_id: {"+": CompressedState, "-":
+        CompressedState}}} for a change. Either way, a *state* value (as
+        opposed to just an attribute) shows up under the "s" key of the
+        relevant CompressedState - absent entirely if this particular
+        message didn't change the state (e.g. an attributes-only update),
+        which this treats as "nothing to do" rather than guessing.
+        """
+        raw_states: dict[str, Any] = {}
+        for entity_id, compressed in event.get("a", {}).items():
+            if "s" in compressed:
+                raw_states[entity_id] = compressed["s"]
+        for entity_id, diff in event.get("c", {}).items():
+            plus = diff.get("+", {})
+            if "s" in plus:
+                raw_states[entity_id] = plus["s"]
+
+        for entity_id, raw_value in raw_states.items():
+            key = self._settings_helper_entity_ids.get(entity_id)
+            if key is None:
+                continue
+            self._apply_settings_helper_change(entity_id, key, raw_value)
+
+    def _apply_settings_helper_change(self, entity_id: str, key: str, raw_value: Any) -> None:
+        if key == "beat_multiplier":
+            value: Any = _OPTION_TO_BEAT_MULTIPLIER.get(raw_value)
+            if value is None:
+                return
+        elif key in ("hue_lock_enabled", "restore_on_stop"):
+            value = raw_value == "on"
+        elif key in ("brightness", "sensitivity", "hue_lock_deg"):
+            try:
+                value = int(float(raw_value))
+            except (TypeError, ValueError):
+                return
+        else:
+            value = raw_value
+
+        if self._last_pushed_helper_values.get(entity_id) == value:
+            # Echo of our own _push_settings_helpers() write, not a real
+            # user change - applying it again would be a harmless but
+            # redundant config write (and would re-trigger the settings
+            # flash for no reason).
+            return
+
+        try:
+            if key == "brightness":
+                self.provider.set_brightness(value)
+            elif key == "beat_multiplier":
+                self.provider.set_beat_multiplier(value)
+            elif key == "transition_style":
+                self.provider.set_transition_style(value)
+            elif key == "sensitivity":
+                self.provider.set_sensitivity(value)
+            elif key == "hue_lock_enabled":
+                self.provider.set_hue_lock_enabled(value)
+            elif key == "hue_lock_deg":
+                self.provider.set_hue_lock_deg(value)
+            elif key == "restore_on_stop":
+                self.provider.set_restore_on_stop(value)
+        except ValueError:
+            self.logger.warning("Ignoring invalid %s value from %s: %r", key, entity_id, raw_value)
+            return
+
+        self._last_pushed_helper_values[entity_id] = value
+        self.update_settings(**{key: value})
+
     async def stop(self) -> None:
         """Stop the bridge."""
         self._cancel_render_loop()
         self._cancel_watchdog()
+        if self._settings_helpers_unsub is not None:
+            self._settings_helpers_unsub()
+            self._settings_helpers_unsub = None
         if self._stop_debounce_task and not self._stop_debounce_task.done():
             self._stop_debounce_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -285,6 +637,7 @@ class HALightGroupBridge:
         await self._restore_pre_sync_state()
 
         self._hass = None
+        self._viz_player = None
         self._is_streaming = False
         self.logger.debug("HA Lights bridge stopped for '%s'", self.group_name)
 
@@ -310,6 +663,14 @@ class HALightGroupBridge:
                 hue_lock_enabled=hue_lock_enabled,
                 hue_lock_deg=hue_lock_deg,
             )
+        # Mirrors a color_mode change made via Music Assistant's own settings
+        # page into Home Assistant's Sound Mode dropdown. The reverse
+        # direction (HA -> here) goes through _on_sound_mode_selected instead,
+        # which calls this same method - harmless if both run for the same
+        # value, not double-applied (just sets the same attribute twice).
+        if color_mode is not None and self._viz_player is not None:
+            self._viz_player._attr_active_sound_mode = color_mode  # noqa: SLF001
+            self._viz_player.update_state()
         # Not an analyzer concern - this is purely a bridge-level behavior
         # (what to do at stream-end), not anything rendered per-tick.
         if restore_on_stop is not None:

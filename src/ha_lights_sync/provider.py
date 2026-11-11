@@ -207,12 +207,28 @@ class HALightsSyncProvider(PluginProvider):
         value = self.config.get_value(CONF_COLOR_MODE)
         return str(value) if value in COLOR_MODES else DEFAULT_COLOR_MODE
 
+    def set_color_mode(self, mode: str) -> None:
+        """
+        Persist a color_mode change initiated from outside Music Assistant's own config UI.
+
+        Specifically: Home Assistant's Sound Mode selector, via bridge.py's
+        _wire_sound_mode/_on_sound_mode_selected. Goes through the same
+        _update_config_value every other provider uses for a value that must
+        survive a restart, so this is indistinguishable from a change made in
+        Music Assistant's own settings page afterward.
+        """
+        self._update_config_value(CONF_COLOR_MODE, mode)
+
     def get_brightness(self) -> int:
         value = self.config.get_value(CONF_BRIGHTNESS)
         try:
             return max(1, min(100, int(value)))
         except (TypeError, ValueError):
             return DEFAULT_BRIGHTNESS
+
+    def set_brightness(self, value: int) -> None:
+        """Persist a brightness change initiated from outside MA's own config UI (see set_color_mode)."""
+        self._update_config_value(CONF_BRIGHTNESS, max(1, min(100, int(value))))
 
     def get_beat_multiplier(self) -> int:
         value = self.config.get_value(CONF_BEAT_MULTIPLIER)
@@ -222,9 +238,23 @@ class HALightsSyncProvider(PluginProvider):
             return DEFAULT_BEAT_MULTIPLIER
         return value if value in BEAT_MULTIPLIERS else DEFAULT_BEAT_MULTIPLIER
 
+    def set_beat_multiplier(self, value: int) -> None:
+        """Persist a Speed change initiated from outside MA's own config UI (see set_color_mode)."""
+        if value not in BEAT_MULTIPLIERS:
+            msg = f"{value!r} is not a valid beat_multiplier"
+            raise ValueError(msg)
+        self._update_config_value(CONF_BEAT_MULTIPLIER, value)
+
     def get_transition_style(self) -> str:
         value = self.config.get_value(CONF_TRANSITION_STYLE)
         return str(value) if value in TRANSITION_STYLES else DEFAULT_TRANSITION_STYLE
+
+    def set_transition_style(self, value: str) -> None:
+        """Persist a transition_style change initiated from outside MA's own config UI (see set_color_mode)."""
+        if value not in TRANSITION_STYLES:
+            msg = f"{value!r} is not a valid transition_style"
+            raise ValueError(msg)
+        self._update_config_value(CONF_TRANSITION_STYLE, value)
 
     def get_sensitivity(self) -> int:
         value = self.config.get_value(CONF_SENSITIVITY)
@@ -234,9 +264,18 @@ class HALightsSyncProvider(PluginProvider):
         except (TypeError, ValueError):
             return DEFAULT_SENSITIVITY
 
+    def set_sensitivity(self, value: int) -> None:
+        """Persist a sensitivity change initiated from outside MA's own config UI (see set_color_mode)."""
+        lo, hi = SENSITIVITY_RANGE
+        self._update_config_value(CONF_SENSITIVITY, max(lo, min(hi, int(value))))
+
     def get_hue_lock_enabled(self) -> bool:
         value = self.config.get_value(CONF_HUE_LOCK_ENABLED)
         return bool(value) if value is not None else DEFAULT_HUE_LOCK_ENABLED
+
+    def set_hue_lock_enabled(self, value: bool) -> None:
+        """Persist a Lock color change initiated from outside MA's own config UI (see set_color_mode)."""
+        self._update_config_value(CONF_HUE_LOCK_ENABLED, bool(value))
 
     def get_hue_lock_deg(self) -> int:
         value = self.config.get_value(CONF_HUE_LOCK_DEG)
@@ -246,9 +285,18 @@ class HALightsSyncProvider(PluginProvider):
         except (TypeError, ValueError):
             return DEFAULT_HUE_LOCK_DEG
 
+    def set_hue_lock_deg(self, value: int) -> None:
+        """Persist a locked-hue-degree change initiated from outside MA's own config UI (see set_color_mode)."""
+        lo, hi = HUE_LOCK_RANGE
+        self._update_config_value(CONF_HUE_LOCK_DEG, max(lo, min(hi, int(value))))
+
     def get_restore_on_stop(self) -> bool:
         value = self.config.get_value(CONF_RESTORE_ON_STOP)
         return bool(value) if value is not None else DEFAULT_RESTORE_ON_STOP
+
+    def set_restore_on_stop(self, value: bool) -> None:
+        """Persist a restore-on-stop change initiated from outside MA's own config UI (see set_color_mode)."""
+        self._update_config_value(CONF_RESTORE_ON_STOP, bool(value))
 
     def get_light_entity_ids(self) -> list[str]:
         """
